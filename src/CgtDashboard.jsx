@@ -192,7 +192,7 @@ async function avQuote(symbol, key) {
 }
 async function fxToGBP(ccy) {
   if (ccy === "GBP" || ccy === "GBp") return 1;
-  try { const r = await fetch(`https://api.frankfurter.app/latest?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
+  try { const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
   catch { return null; }
 }
 const toGBP = (raw, ccy, fx) => (ccy === "GBp" ? raw / 100 : ccy === "GBP" ? raw : fx ? raw * fx : null);
@@ -432,7 +432,7 @@ function LedgerTab({ txns, setTxns }) {
     if (draft.nativeCurrency === "GBP") return;
     setFxBusy(true);
     try {
-      const res = await fetch(`https://api.frankfurter.app/${draft.date}?from=${draft.nativeCurrency}&to=GBP`);
+      const res = await fetch(`https://api.frankfurter.dev/v1/${draft.date}?from=${draft.nativeCurrency}&to=GBP`);
       const j = await res.json();
       const rate = j?.rates?.GBP;
       if (rate) set("fxRate", +rate.toFixed(6));
