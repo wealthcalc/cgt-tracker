@@ -3,7 +3,7 @@ import Papa from "papaparse";
 import {
   Plus, Trash2, Download, Upload, Wand2, RefreshCw, Moon, Sun,
   TableProperties, Receipt, FlaskConical, FileUp, AlertTriangle, Check,
-  Wallet, TrendingUp, TrendingDown, FileText, Printer, AlertCircle,
+  Wallet, TrendingUp, TrendingDown, FileText, Printer, AlertCircle, PoundSterling,
 } from "lucide-react";
 
 // Safe localStorage wrapper: persists on the deployed app, silently no-ops in
@@ -29,6 +29,9 @@ function matchWithPool(txns) {
   const disps = txns.filter((t) => t.side === "SELL")
     .map((t) => ({ t, date: dUTC(t.date), remaining: t.quantity, legs: [] }))
     .sort((a, b) => a.date - b.date);
+  // ERI: excess reportable income, a cost-only uplift to the S104 pool on the fund
+  // distribution date. No units; excluded from same-day / 30-day matching.
+  const eris = txns.filter((t) => t.side === "ERI").map((t) => ({ date: dUTC(t.date), cost: t.gbpAmount }));
 
   const alloc = (d, n, cost, method, acqDate) => {
     const proceeds = d.t.gbpAmount * (n / d.t.quantity);
@@ -48,11 +51,12 @@ function matchWithPool(txns) {
   }
   const ev = [];
   for (const a of acqs) if (a.remaining > 0) ev.push([a.date, 0, a]);
+  for (const e of eris) ev.push([e.date, 0, { eri: true, cost: e.cost }]);
   for (const d of disps) if (d.remaining > 1e-9) ev.push([d.date, 1, d]);
   ev.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
   let pq = 0, pc = 0;
   for (const [, kind, o] of ev) {
-    if (kind === 0) { pq += o.remaining; pc += o.unit * o.remaining; o.remaining = 0; }
+    if (kind === 0) { if (o.eri) { if (pq > 1e-9) pc += o.cost; continue; } pq += o.remaining; pc += o.unit * o.remaining; o.remaining = 0; }
     else {
       const n = o.remaining;
       if (n > pq + 1e-6) throw new Error(`Disposal ${o.t.date} ${o.t.ticker} exceeds shares held (needs ${round4(n)}, pool holds ${round4(pq)}).`);
@@ -153,6 +157,201 @@ const sharesForTargetGain = (q, c, p, target) => {
 };
 const fmtRate = (r) => `${(r * 100).toFixed(0)}%`;
 
+// Chain per-year CGT liability across tax years, carrying losses forward.
+// In-year losses offset in-year gains fully; brought-forward losses reduce net
+// gains only down to the AEA; unused losses carry forward (4-year claim window).
+function liabilityAllYears(disposals, { incomeByYear = {}, initialCarried = 0 } = {}) {
+  const byYear = {}; for (const d of disposals) (byYear[d.taxYear] ||= []).push(d);
+  const years = Object.keys(byYear).sort();
+  let carried = initialCarried; const results = {};
+  for (const y of years) {
+    const res = liabilityForYear(byYear[y], { income: incomeByYear[y] || 0, carriedLosses: carried });
+    const carriedInto = carried, inYearNetLoss = Math.max(0, res.losses - res.gains);
+    carried = carried - res.usedCarried + inYearNetLoss;
+    results[y] = { ...res, carriedInto, carriedOut: carried, inYearNetLoss };
+  }
+  return { years, results, carriedForward: carried };
+}
+const unitsHeldAt = (txns, dateStr) => {
+  let q = 0; for (const t of txns) if ((t.side === "BUY" || t.side === "SELL") && t.date <= dateStr) q += (t.side === "BUY" ? 1 : -1) * t.quantity; return q;
+};
+
+/* ---- UK income tax on investment income (dividends + interest), stacked on
+   salary. Nil-rate allowances (PSA, dividend allowance) sit at 0% but occupy band
+   space. Verified in incometax.test.mjs (11/11). ---- */
+const _I = (pa, basicLimit, addl, divAllow, div, sav, psa) => ({ pa, basicLimit, addl, divAllow, div, sav, psa });
+const _DO = { basic: 0.075, higher: 0.325, addl: 0.381 }, _DM = { basic: 0.0875, higher: 0.3375, addl: 0.3935 }, _DN = { basic: 0.1075, higher: 0.3575, addl: 0.3935 };
+const _SAV = { basic: 0.20, higher: 0.40, addl: 0.45 }, _PSA = { basic: 1000, higher: 500, addl: 0 };
+const INCOME_YEARS = {
+  "2016/17": _I(11000, 32000, 150000, 5000, _DO, _SAV, _PSA), "2017/18": _I(11500, 33500, 150000, 5000, _DO, _SAV, _PSA),
+  "2018/19": _I(11850, 34500, 150000, 2000, _DO, _SAV, _PSA), "2019/20": _I(12500, 37500, 150000, 2000, _DO, _SAV, _PSA),
+  "2020/21": _I(12500, 37500, 150000, 2000, _DO, _SAV, _PSA), "2021/22": _I(12570, 37700, 150000, 2000, _DO, _SAV, _PSA),
+  "2022/23": _I(12570, 37700, 150000, 2000, _DM, _SAV, _PSA), "2023/24": _I(12570, 37700, 125140, 1000, _DM, _SAV, _PSA),
+  "2024/25": _I(12570, 37700, 125140, 500, _DM, _SAV, _PSA), "2025/26": _I(12570, 37700, 125140, 500, _DM, _SAV, _PSA),
+  "2026/27": _I(12570, 37700, 125140, 500, _DN, _SAV, _PSA),
+};
+const incomeCfg = (year) => INCOME_YEARS[year] || { ...INCOME_YEARS["2026/27"], assumed: true };
+function _walk(pos, amount, basicTop, higherTop, rates) {
+  const bounds = [basicTop, higherTop, Infinity], rs = [rates.basic, rates.higher, rates.addl];
+  let tax = 0, p = pos, rem = amount;
+  for (let i = 0; i < 3 && rem > 1e-9; i++) { if (p >= bounds[i]) continue; const take = Math.min(rem, bounds[i] - p); tax += take * rs[i]; p += take; rem -= take; }
+  return { tax, end: p };
+}
+function investmentIncomeTax({ salary = 0, interest = 0, dividends = 0, year } = {}) {
+  const c = incomeCfg(year), ani = salary + interest + dividends;
+  const pa = paFor(c.pa, ani), basicTop = c.basicLimit, higherTop = Math.max(basicTop, c.addl - pa);
+  let paLeft = pa; const net = (x) => { const u = Math.min(x, paLeft); paLeft -= u; return x - u; };
+  const salT = net(salary), intT = net(interest), divT = net(dividends), taxableTotal = salT + intT + divT;
+  const band = taxableTotal <= basicTop ? "basic" : taxableTotal <= higherTop ? "higher" : "addl";
+  const psa = c.psa[band], startRate = Math.max(0, 5000 - salT);
+  let pos = salT, interestTax = 0, dividendTax = 0;
+  { let rem = intT; const z = Math.min(rem, startRate + psa); pos += z; rem -= z; const r = _walk(pos, rem, basicTop, higherTop, c.sav); interestTax = r.tax; pos = r.end; }
+  { let rem = divT; const z = Math.min(rem, c.divAllow); pos += z; rem -= z; const r = _walk(pos, rem, basicTop, higherTop, c.div); dividendTax = r.tax; pos = r.end; }
+  const r2 = (x) => Math.round(x * 100) / 100;
+  return { year, assumed: !!c.assumed, interestTax: r2(interestTax), dividendTax: r2(dividendTax), tax: r2(interestTax + dividendTax), personalAllowance: pa, band, divAllow: c.divAllow, psa };
+}
+
+/* ---- IBKR CSV import (Flex Query + Activity Statement) -> trades + income.
+   Verified in ibkr.test.mjs (20/20). ---- */
+function parseCSVRows(text) {
+  const rows = []; let row = [], cell = "", q = false;
+  const s = text.replace(/\r\n?/g, "\n");
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) { if (c === '"') { if (s[i + 1] === '"') { cell += '"'; i++; } else q = false; } else cell += c; }
+    else if (c === '"') q = true;
+    else if (c === ",") { row.push(cell); cell = ""; }
+    else if (c === "\n") { row.push(cell); rows.push(row); row = []; cell = ""; }
+    else cell += c;
+  }
+  if (cell !== "" || row.length) { row.push(cell); rows.push(row); }
+  return rows.filter((r) => r.some((c) => c.trim() !== ""));
+}
+const _ibnorm = (h) => h.toLowerCase().replace(/[^a-z0-9]/g, "");
+const _ibnum = (x) => { if (x == null) return 0; const n = parseFloat(String(x).replace(/,/g, "")); return isFinite(n) ? n : 0; };
+const _ibdate = (x) => {
+  if (!x) return ""; const s = String(x).trim(); let m = s.match(/^(\d{4})(\d{2})(\d{2})$/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = s.match(/^(\d{4})\/(\d{2})\/(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; return "";
+};
+const _IBSTOCK = new Set(["stk", "etf", "fund", "stocks", "equity", "closedendfund"]);
+const _ibpick = (headerIndex) => (row, ...keys) => { for (const k of keys) { const i = headerIndex[k]; if (i != null && row[i] !== undefined) return row[i]; } return undefined; };
+function _ibTrade(get, defaultWrapper, baseCurrency, warnings) {
+  const symbol = (get("symbol", "underlyingsymbol") || "").trim().toUpperCase();
+  const date = _ibdate(get("tradedate", "datetime", "date"));
+  if (!symbol || !date) return null;
+  const asset = _ibnorm(get("assetclass", "assetcategory") || "stk");
+  if (asset && !_IBSTOCK.has(asset)) { warnings.push(`Skipped ${symbol} ${date}: asset class "${asset}" not supported.`); return null; }
+  const qtyRaw = _ibnum(get("quantity"));
+  const bs = (get("buysell") || "").trim().toUpperCase();
+  const side = bs ? (bs.startsWith("S") ? "SELL" : "BUY") : (qtyRaw < 0 ? "SELL" : "BUY");
+  const quantity = Math.abs(qtyRaw); if (!quantity) return null;
+  const currency = (get("currencyprimary", "currency") || "GBP").trim().toUpperCase();
+  const proceeds = _ibnum(get("proceeds")), commission = _ibnum(get("ibcommission", "commission", "commfee", "commissionandtax")), taxes = _ibnum(get("taxes", "tax"));
+  const netcash = get("netcash");
+  const native = Math.abs(netcash !== undefined && netcash !== "" ? _ibnum(netcash) + taxes : proceeds + commission + taxes);
+  const fxToBase = _ibnum(get("fxratetobase", "fxrate"));
+  const isin = (get("isin", "securityid") || "").trim().toUpperCase();
+  let gbpAmount = null, fxRate = null, needsFx = false;
+  if (currency === "GBP") { gbpAmount = native; fxRate = 1; }
+  else if (baseCurrency === "GBP" && fxToBase) { gbpAmount = native * fxToBase; fxRate = fxToBase; }
+  else needsFx = true;
+  return { date, ticker: symbol, isin, side, quantity, nativeCurrency: currency, nativeAmount: native, fxRate, gbpAmount: gbpAmount == null ? null : Math.round(gbpAmount * 100) / 100, needsFx, wrapper: defaultWrapper };
+}
+function _ibCash(get, defaultWrapper, baseCurrency) {
+  const typ = _ibnorm(get("type", "activitydescription", "description") || "");
+  let kind = null;
+  if (typ.includes("withholding")) return null;
+  if (typ.includes("dividend") || typ.includes("inlieu") || typ.includes("paymentinlieu")) kind = "dividend";
+  else if (typ.includes("interest")) kind = "interest"; else return null;
+  const amount = _ibnum(get("amount")); if (amount <= 0) return null;
+  const date = _ibdate(get("settledate", "reportdate", "date", "paydate")); if (!date) return null;
+  const currency = (get("currencyprimary", "currency") || "GBP").trim().toUpperCase();
+  const fxToBase = _ibnum(get("fxratetobase", "fxrate"));
+  const symbol = (get("symbol", "underlyingsymbol") || "").trim().toUpperCase();
+  const isin = (get("isin", "securityid") || "").trim().toUpperCase();
+  let gbp = null, fxRate = null, needsFx = false;
+  if (currency === "GBP") { gbp = amount; fxRate = 1; }
+  else if (baseCurrency === "GBP" && fxToBase) { gbp = amount * fxToBase; fxRate = fxToBase; }
+  else needsFx = true;
+  return { date, ticker: symbol, isin, kind, nativeCurrency: currency, nativeAmount: amount, fxRate, amount: gbp == null ? null : Math.round(gbp * 100) / 100, needsFx, wrapper: defaultWrapper };
+}
+function _ibFlex(rows, defaultWrapper, baseCurrency, warnings) {
+  const header = rows[0].map(_ibnorm); const headerIndex = {}; header.forEach((h, i) => { if (!(h in headerIndex)) headerIndex[h] = i; });
+  const pick = _ibpick(headerIndex); const has = (...k) => k.some((x) => headerIndex[x] != null);
+  const looksTrades = has("tradedate", "buysell", "tradeprice") || (has("quantity") && has("proceeds"));
+  const looksCash = has("type", "amount") && !has("tradeprice", "buysell");
+  const trades = [], income = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r]; const get = (...k) => pick(row, ...k);
+    if (looksCash && !looksTrades) { const c = _ibCash(get, defaultWrapper, baseCurrency); if (c) income.push(c); continue; }
+    const t = _ibTrade(get, defaultWrapper, baseCurrency, warnings); if (t) { trades.push(t); continue; }
+    if (has("type", "amount")) { const c = _ibCash(get, defaultWrapper, baseCurrency); if (c) income.push(c); }
+  }
+  return { trades, income };
+}
+function _ibActivity(rows, defaultWrapper, baseCurrency, warnings) {
+  const trades = [], income = []; const sections = {};
+  for (const row of rows) { const name = row[0], tag = row[1];
+    if (tag === "Header") sections[name] = { header: row.slice(2).map(_ibnorm), data: [] };
+    else if (tag === "Data" && sections[name]) sections[name].data.push(row.slice(2)); }
+  const build = (sec) => { const idx = {}; sec.header.forEach((h, i) => { if (!(h in idx)) idx[h] = i; }); return { idx, pick: _ibpick(idx) }; };
+  if (sections["Trades"]) { const { pick } = build(sections["Trades"]);
+    for (const row of sections["Trades"].data) { const get = (...k) => pick(row, ...k);
+      const disc = _ibnorm(get("datadiscriminator") || "order"); if (disc && !["order", "trade"].includes(disc)) continue;
+      const t = _ibTrade(get, defaultWrapper, baseCurrency, warnings); if (t) trades.push(t); } }
+  for (const secName of ["Dividends", "Payment In Lieu Of Dividends", "Interest"]) {
+    if (!sections[secName]) continue; const { pick } = build(sections[secName]);
+    for (const row of sections[secName].data) { const get = (...k) => pick(row, ...k);
+      const desc = get("description") || ""; const isinM = String(desc).match(/\(([A-Z]{2}[A-Z0-9]{9}\d)\)/); const symM = String(desc).match(/^([A-Z0-9.]+)\b/);
+      const kind = secName === "Interest" ? "interest" : "dividend"; const amount = _ibnum(get("amount")); if (amount <= 0) continue;
+      const date = _ibdate(get("date", "settledate", "reportdate")); if (!date) continue;
+      const currency = (get("currency", "currencyprimary") || "GBP").trim().toUpperCase();
+      let gbp = null, needsFx = false; if (currency === "GBP") gbp = amount; else needsFx = true;
+      income.push({ date, ticker: symM ? symM[1].toUpperCase() : "", isin: isinM ? isinM[1] : "", kind, nativeCurrency: currency, nativeAmount: amount, fxRate: currency === "GBP" ? 1 : null, amount: gbp == null ? null : Math.round(gbp * 100) / 100, needsFx, wrapper: defaultWrapper }); } }
+  return { trades, income };
+}
+function parseIBKR(text, { defaultWrapper = "GIA", baseCurrency = "GBP" } = {}) {
+  const rows = parseCSVRows(text); if (!rows.length) return { trades: [], income: [], warnings: ["Empty file."], baseCurrency };
+  const warnings = [];
+  const sectioned = rows.some((r) => r[1] === "Header" && ["Trades", "Dividends", "Interest", "Deposits & Withdrawals", "Payment In Lieu Of Dividends"].includes(r[0]));
+  const { trades, income } = sectioned ? _ibActivity(rows, defaultWrapper, baseCurrency, warnings) : _ibFlex(rows, defaultWrapper, baseCurrency, warnings);
+  const needFx = trades.filter((t) => t.needsFx).length + income.filter((t) => t.needsFx).length;
+  if (needFx) warnings.push(`${needFx} row(s) in a non-GBP currency need an FX rate; fetching by trade date.`);
+  return { trades, income, warnings, baseCurrency, format: sectioned ? "activity" : "flex" };
+}
+
+/* ---- Multi-year AEA disposal / gain-harvesting optimiser. Verified in
+   optimiser.test.mjs (14/14). ---- */
+const nextTaxYear = (y) => { const a = Number(y.split("/")[0]) + 1; return `${a}/${String(a + 1).slice(-2)}`; };
+function optimiseDisposals({ holdings, startYear, years = 10, income = 0, useBasicBand = false, growth = 0 }) {
+  let hs = holdings.map((h) => ({ ticker: h.ticker, qty: +h.qty, avgCost: +h.qty ? +h.cost / +h.qty : 0, price: +h.price })).filter((h) => h.qty > 0 && isFinite(h.price) && h.price > 0);
+  const embedded = () => hs.reduce((s, h) => s + Math.max(0, h.qty * (h.price - h.avgCost)), 0);
+  const startEmbedded = embedded(); const schedule = []; let y = startYear, totalWashed = 0, yearsToClear = null;
+  for (let i = 0; i < years; i++) {
+    const cfg = cfgFor(y); const pa = paFor(cfg.pa, income); const taxableIncome = Math.max(0, income - pa);
+    const bandRoom = Math.max(0, cfg.basicLimit - taxableIncome); const rate = cfg.rates[cfg.rates.length - 1];
+    const gainBudget = cfg.aea + (useBasicBand ? bandRoom : 0);
+    let budgetLeft = gainBudget, realised = 0; const sells = [];
+    const order = hs.map((h, idx) => ({ idx, gps: h.price - h.avgCost })).filter((o) => o.gps > 0).sort((a, b) => b.gps - a.gps);
+    for (const { idx } of order) {
+      if (budgetLeft <= 1e-6) break; const h = hs[idx], gps = h.price - h.avgCost;
+      const takeGain = Math.min(h.qty * gps, budgetLeft); const shares = takeGain / gps;
+      h.avgCost = ((h.qty - shares) * h.avgCost + shares * h.price) / h.qty;
+      realised += takeGain; budgetLeft -= takeGain;
+      sells.push({ ticker: h.ticker, shares: Math.round(shares * 1e4) / 1e4, gain: Math.round(takeGain * 100) / 100 });
+    }
+    const aeaUsed = Math.min(realised, cfg.aea); const bandGain = Math.max(0, realised - cfg.aea);
+    const tax = Math.round((useBasicBand ? bandGain * rate.basic : 0) * 100) / 100; totalWashed += realised;
+    const remaining = embedded();
+    schedule.push({ year: y, aea: cfg.aea, gainBudget, gainRealised: Math.round(realised * 100) / 100, aeaUsed: Math.round(aeaUsed * 100) / 100, bandGain: Math.round(bandGain * 100) / 100, tax, sells, cumulativeWashed: Math.round(totalWashed * 100) / 100, remainingUnrealised: Math.round(remaining * 100) / 100 });
+    if (remaining <= 1e-6 && yearsToClear == null) yearsToClear = i + 1;
+    if (remaining <= 1e-6) break;
+    if (growth) for (const h of hs) h.price *= 1 + growth; y = nextTaxYear(y);
+  }
+  return { schedule, yearsToClear, totalWashed: Math.round(totalWashed * 100) / 100, startEmbedded: Math.round(startEmbedded * 100) / 100, remainingAfter: Math.round(embedded() * 100) / 100 };
+}
+
 /* ----------------------------- helpers ------------------------------ */
 const round4 = (x) => Math.round(x * 1e4) / 1e4;
 const gbp = (x) => (x < 0 ? "−£" : "£") + Math.abs(x).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -195,6 +394,12 @@ async function fxToGBP(ccy) {
   try { const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
   catch { return null; }
 }
+// FX on a specific date (for imports that lack an FX-to-base rate).
+async function fxHistorical(ccy, date) {
+  if (ccy === "GBP" || ccy === "GBp") return 1;
+  try { const r = await fetch(`https://api.frankfurter.dev/v1/${date}?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
+  catch { return null; }
+}
 const toGBP = (raw, ccy, fx) => (ccy === "GBp" ? raw / 100 : ccy === "GBP" ? raw : fx ? raw * fx : null);
 const avBudget = () => { const c = store.get("cgt.avcount", { date: "", n: 0 }); return c.date === todayISO() ? c : { date: todayISO(), n: 0 }; };
 const avBump = () => { const c = avBudget(); c.n += 1; store.set("cgt.avcount", c); return c.n; };
@@ -207,6 +412,8 @@ export default function App() {
   const [tab, setTab] = useState("cgt");
   const [income, setIncome] = useState(() => store.get("cgt.income", 200000));
   const [carried, setCarried] = useState(() => store.get("cgt.carried", 0));
+  const [incomeEntries, setIncomeEntries] = useState(() => store.get("cgt.incomeEntries", [])); // dividends/interest ledger
+  const [eriEntries, setEriEntries] = useState(() => store.get("cgt.eriEntries", []));           // excess reportable income
   const [prices, setPrices] = useState(() => store.get("cgt.prices", {}));
   const [avKey, setAvKey] = useState(() => store.get("cgt.avkey", ""));
   const [avMeta, setAvMeta] = useState(() => store.get("cgt.avmeta", {}));       // { ticker: {symbol, currency} }
@@ -221,12 +428,27 @@ export default function App() {
   React.useEffect(() => store.set("cgt.pricemeta", priceMeta), [priceMeta]);
   React.useEffect(() => store.set("cgt.income", income), [income]);
   React.useEffect(() => store.set("cgt.carried", carried), [carried]);
+  React.useEffect(() => store.set("cgt.incomeEntries", incomeEntries), [incomeEntries]);
+  React.useEffect(() => store.set("cgt.eriEntries", eriEntries), [eriEntries]);
   React.useEffect(() => store.set("cgt.dark", dark), [dark]);
 
+  // Only unsheltered (GIA) holdings are within scope for CGT and income tax;
+  // ISA / SIPP / LISA are tax-free and excluded from every tax computation.
+  const isGIA = (w) => (w || "GIA") === "GIA";
+  const giaTxns = useMemo(() => txns.filter((t) => isGIA(t.wrapper)), [txns]);
+
+  // Excess reportable income -> synthetic ERI txns (pool cost uplift) + income.
+  const eriTxns = useMemo(() => eriEntries.map((e) => {
+    const units = unitsHeldAt(giaTxns, e.periodEnd || "9999-12-31");
+    const native = units * (+e.perShare || 0);
+    const g = e.currency === "GBp" ? native / 100 : e.currency === "GBP" ? native : native * (+e.fxRate || 0);
+    return { id: "eri-" + e.id, ticker: e.ticker, side: "ERI", date: e.distributionDate, quantity: 0, gbpAmount: Math.round((g || 0) * 100) / 100, _eri: e, _units: units, _gbp: g || 0 };
+  }).filter((t) => t.ticker && t.date), [eriEntries, giaTxns]);
+
   const matched = useMemo(() => {
-    try { setError(null); return matchPortfolio(txns); }
+    try { setError(null); return matchPortfolio([...giaTxns, ...eriTxns]); }
     catch (e) { setError(e.message); return { disposals: [], pools: {} }; }
-  }, [txns]);
+  }, [giaTxns, eriTxns]);
 
   const taxYears = useMemo(() => {
     const s = new Set(matched.disposals.map((d) => d.taxYear));
@@ -235,8 +457,23 @@ export default function App() {
   const [year, setYear] = useState(null);
   const activeYear = year && taxYears.includes(year) ? year : taxYears[0] || "2025/26";
 
+  // Chain CGT losses across all tracked years (initial b/f losses = `carried`).
+  const allYears = useMemo(() => {
+    const yrs = [...new Set(matched.disposals.map((d) => d.taxYear))];
+    const inc = Object.fromEntries(yrs.map((y) => [y, income]));
+    return liabilityAllYears(matched.disposals, { incomeByYear: inc, initialCarried: carried });
+  }, [matched, income, carried]);
+
   const yearDisposals = matched.disposals.filter((d) => d.taxYear === activeYear);
-  const liab = liabilityForYear(yearDisposals, { income, carriedLosses: carried });
+  const liab = allYears.results[activeYear] || liabilityForYear(yearDisposals, { income, carriedLosses: carried });
+
+  // Aggregate dividends/interest per tax year (ledger + ERI-derived income).
+  const incomeByYear = useMemo(() => {
+    const m = {}; const add = (y, kind, amt) => { (m[y] ||= { dividends: 0, interest: 0 }); m[y][kind === "interest" ? "interest" : "dividends"] += amt; };
+    for (const e of incomeEntries) if (e.date && e.amount && isGIA(e.wrapper)) add(ukTaxYear(e.date), e.kind, +e.amount);
+    for (const t of eriTxns) if (t.date) add(ukTaxYear(t.date), t._eri.treatment, t._gbp);
+    return m;
+  }, [incomeEntries, eriTxns]);
 
   const fileRef = useRef(null);
   const [status, setStatus] = useState("");
@@ -317,7 +554,7 @@ export default function App() {
 
           {/* tabs */}
           <div className="flex flex-wrap gap-1 mt-5 border-b border-[var(--border)]">
-            {[["cgt", "CGT summary", TableProperties], ["holdings", "Holdings", Wallet], ["planning", "Planning", TrendingUp], ["report", "Report", FileText], ["ledger", "Transactions", Receipt], ["whatif", "What-if sale", FlaskConical], ["import", "Import CSV", FileUp]].map(([k, label, Icon]) => (
+            {[["cgt", "CGT summary", TableProperties], ["holdings", "Holdings", Wallet], ["income", "Income", PoundSterling], ["planning", "Planning", TrendingUp], ["report", "Report", FileText], ["ledger", "Transactions", Receipt], ["whatif", "What-if sale", FlaskConical], ["import", "Import CSV", FileUp]].map(([k, label, Icon]) => (
               <button key={k} onClick={() => setTab(k)}
                 className={"px-3 py-2 text-sm font-medium flex items-center gap-1.5 border-b-2 -mb-px transition " +
                   (tab === k ? "border-[var(--accent)] text-[var(--fg)]" : "border-transparent text-[var(--muted)] hover:text-[var(--fg)]")}>
@@ -334,13 +571,14 @@ export default function App() {
           )}
 
           <div className="mt-5">
-            {tab === "cgt" && <CgtTab {...{ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried }} />}
+            {tab === "cgt" && <CgtTab {...{ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried, carryForward: allYears.carriedForward }} />}
+            {tab === "income" && <IncomeTab {...{ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns }} />}
             {tab === "holdings" && <HoldingsTab {...{ pools: matched.pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns }} />}
-            {tab === "planning" && <PlanningTab {...{ pools: matched.pools, prices, setPrices, disposals: matched.disposals, txns }} />}
+            {tab === "planning" && <PlanningTab {...{ pools: matched.pools, prices, setPrices, disposals: matched.disposals, txns: giaTxns, income }} />}
             {tab === "report" && <ReportTab {...{ taxYears, disposals: matched.disposals, income, carried }} />}
             {tab === "ledger" && <LedgerTab {...{ txns, setTxns }} />}
             {tab === "whatif" && <WhatIfTab {...{ pools: matched.pools, disposals: matched.disposals, income, carried, prices }} />}
-            {tab === "import" && <ImportTab {...{ setTxns, setTab }} />}
+            {tab === "import" && <ImportTab {...{ setTxns, setTab, setIncomeEntries }} />}
           </div>
 
           <p className="text-xs text-[var(--muted)] mt-8 leading-relaxed">
@@ -352,8 +590,154 @@ export default function App() {
   );
 }
 
+/* ----------------------------- Income tab --------------------------- */
+const addMonthsISO = (s, n) => { if (!s) return ""; const [y, m, d] = s.split("-").map(Number); const dt = new Date(Date.UTC(y, m - 1 + n, d)); return dt.toISOString().slice(0, 10); };
+const DIV_BLANK = () => ({ id: uid(), date: todayISO(), ticker: "", kind: "dividend", amount: "" });
+const ERI_BLANK = () => ({ id: uid(), ticker: "", periodEnd: "", distributionDate: "", perShare: "", currency: "GBp", fxRate: 1, treatment: "dividend" });
+
+function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns }) {
+  const [dv, setDv] = useState(DIV_BLANK());
+  const [er, setEr] = useState(ERI_BLANK());
+  const [fxBusy, setFxBusy] = useState(false);
+  const years = Object.keys(incomeByYear).sort().reverse();
+
+  const addDiv = () => { if (!dv.date || !(+dv.amount)) return; setIncomeEntries((p) => [...p, { ...dv, amount: +dv.amount }]); setDv(DIV_BLANK()); };
+  const setEriF = (k, v) => setEr((e) => { const n = { ...e, [k]: v }; if (k === "periodEnd") n.distributionDate = addMonthsISO(v, 6); if (k === "currency" && (v === "GBP" || v === "GBp")) n.fxRate = 1; return n; });
+  const addEri = () => { if (!er.ticker || !er.periodEnd || !er.distributionDate || !(+er.perShare)) return; setEriEntries((p) => [...p, { ...er, ticker: er.ticker.toUpperCase(), perShare: +er.perShare, fxRate: +er.fxRate || 0 }]); setEr(ERI_BLANK()); };
+  const fetchEriFx = async () => {
+    if (er.currency === "GBP" || er.currency === "GBp") return;
+    setFxBusy(true);
+    try { const fx = await fxToGBP(er.currency); if (fx) setEr((e) => ({ ...e, fxRate: +fx.toFixed(6) })); } catch { /* ignore */ }
+    setFxBusy(false);
+  };
+  const eriPreview = (() => {
+    const units = unitsHeldAt(txns, er.periodEnd || "9999-12-31");
+    const native = units * (+er.perShare || 0);
+    const g = er.currency === "GBp" ? native / 100 : er.currency === "GBP" ? native : native * (+er.fxRate || 0);
+    return { units, g };
+  })();
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-end gap-3 flex-wrap">
+        <Field label="Employment / other income (£)"><input type="number" value={income} onChange={(e) => setIncome(+e.target.value || 0)} className="input num w-48" /></Field>
+        <p className="text-xs text-[var(--muted)] pb-2 max-w-md">Dividends and interest here are stacked on top of this income. Only taxable (GIA) income belongs here — anything inside an ISA or pension is tax-free and should be excluded.</p>
+      </div>
+
+      {/* Per-year income tax */}
+      {years.length ? (
+        <div className="space-y-2">
+          <h3 className="font-semibold text-sm">Investment income tax by year</h3>
+          <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-[var(--panel2)] text-[var(--muted)]">
+                <tr>{["Tax year", "Dividends", "Interest", "Dividend tax", "Interest tax", "Total"].map((h, i) => <th key={i} className={"py-2 px-3 font-medium " + (i ? "text-right" : "text-left")}>{h}</th>)}</tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border)]">
+                {years.map((y) => {
+                  const d = incomeByYear[y], r = investmentIncomeTax({ salary: income, interest: d.interest, dividends: d.dividends, year: y });
+                  return (
+                    <tr key={y}>
+                      <td className="py-2 px-3 font-medium">{y}{r.assumed ? " *" : ""}</td>
+                      <td className="py-2 px-3 text-right num">{gbp(d.dividends)}</td>
+                      <td className="py-2 px-3 text-right num">{gbp(d.interest)}</td>
+                      <td className="py-2 px-3 text-right num">{gbp(r.dividendTax)}</td>
+                      <td className="py-2 px-3 text-right num">{gbp(r.interestTax)}</td>
+                      <td className="py-2 px-3 text-right num font-semibold text-[var(--loss)]">{gbp(r.tax)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[var(--muted)]">Dividend allowance and Personal Savings Allowance are applied automatically by year and band. Figures marked * use assumed (latest) rates for years not in the table.</p>
+        </div>
+      ) : <Empty msg="No dividends, interest or ERI recorded yet. Add them below to see the income-tax position." />}
+
+      {/* Dividend / interest ledger */}
+      <div className="space-y-2">
+        <h3 className="font-semibold text-sm">Dividends & interest</h3>
+        <div className="flex items-end gap-2 flex-wrap rounded-xl border border-[var(--border)] bg-[var(--panel)] p-3">
+          <Field label="Date"><input type="date" value={dv.date} onChange={(e) => setDv({ ...dv, date: e.target.value })} className="input num" /></Field>
+          <Field label="Ticker (optional)"><input value={dv.ticker} onChange={(e) => setDv({ ...dv, ticker: e.target.value.toUpperCase() })} className="input num w-24" placeholder="—" /></Field>
+          <Field label="Type"><select value={dv.kind} onChange={(e) => setDv({ ...dv, kind: e.target.value })} className="input"><option value="dividend">Dividend</option><option value="interest">Interest</option></select></Field>
+          <Field label="Amount (£, GBP)"><input type="number" value={dv.amount} onChange={(e) => setDv({ ...dv, amount: e.target.value })} className="input num w-32" placeholder="0.00" /></Field>
+          <button onClick={addDiv} className="btn-accent"><Plus size={15} /> Add</button>
+        </div>
+        {incomeEntries.length > 0 && (
+          <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+            <table className="w-full text-sm">
+              <tbody className="divide-y divide-[var(--border)]">
+                {incomeEntries.slice().sort((a, b) => (a.date < b.date ? 1 : -1)).map((e) => (
+                  <tr key={e.id}>
+                    <td className="py-2 px-3 num text-[var(--muted)]">{e.date}</td>
+                    <td className="py-2 px-3">{e.ticker || "—"}</td>
+                    <td className="py-2 px-3 capitalize">{e.kind}</td>
+                    <td className="py-2 px-3 num">{ukTaxYear(e.date)}</td>
+                    <td className="py-2 px-3 text-right num">{gbp(+e.amount)}</td>
+                    <td className="py-2 px-3 text-right"><button onClick={() => setIncomeEntries((p) => p.filter((x) => x.id !== e.id))} className="text-[var(--muted)] hover:text-[var(--loss)]"><Trash2 size={15} /></button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {/* ERI */}
+      <div className="space-y-2">
+        <h3 className="font-semibold text-sm">Excess reportable income (offshore reporting funds)</h3>
+        <p className="text-xs text-[var(--muted)] max-w-3xl">For accumulating ETFs and other offshore reporting funds. Enter the reportable income per share from the fund's report and its reporting-period end. It's taxed on the fund distribution date (period end + 6 months), in that tax year, as dividend (equity funds) or interest (bond funds &gt;60% debt) — and the taxed amount is added to the Section 104 pool, lowering the gain on later disposals.</p>
+        <div className="grid gap-2 rounded-xl border border-[var(--border)] bg-[var(--panel)] p-3" style={{ gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))" }}>
+          <Field label="Ticker"><input value={er.ticker} onChange={(e) => setEriF("ticker", e.target.value.toUpperCase())} className="input num w-full" placeholder="e.g. XNAQ" /></Field>
+          <Field label="Reporting period end"><input type="date" value={er.periodEnd} onChange={(e) => setEriF("periodEnd", e.target.value)} className="input num w-full" /></Field>
+          <Field label="Fund distribution date"><input type="date" value={er.distributionDate} onChange={(e) => setEriF("distributionDate", e.target.value)} className="input num w-full" /></Field>
+          <Field label="Reportable income / share"><input type="number" value={er.perShare} onChange={(e) => setEriF("perShare", e.target.value)} className="input num w-full" placeholder="0.00" /></Field>
+          <Field label="Currency"><select value={er.currency} onChange={(e) => setEriF("currency", e.target.value)} className="input w-full">{["GBp", "GBP", "USD", "EUR"].map((c) => <option key={c} value={c}>{c}</option>)}</select></Field>
+          <Field label="FX → GBP">
+            <div className="flex gap-1"><input type="number" value={er.fxRate} onChange={(e) => setEriF("fxRate", e.target.value)} disabled={er.currency === "GBP" || er.currency === "GBp"} className="input num w-full disabled:opacity-50" />
+              {er.currency !== "GBP" && er.currency !== "GBp" && <button onClick={fetchEriFx} disabled={fxBusy} className="text-[var(--accent)] px-1" title="Fetch latest FX">{fxBusy ? "…" : "↻"}</button>}</div>
+          </Field>
+          <Field label="Taxed as"><select value={er.treatment} onChange={(e) => setEriF("treatment", e.target.value)} className="input w-full"><option value="dividend">Dividend</option><option value="interest">Interest</option></select></Field>
+          <div className="flex items-end"><button onClick={addEri} className="btn-accent w-full justify-center"><Plus size={15} /> Add</button></div>
+        </div>
+        {er.ticker && er.periodEnd && (
+          <p className="text-xs text-[var(--muted)] num">Preview: {num(eriPreview.units, eriPreview.units % 1 ? 4 : 0)} units held at {er.periodEnd} → ERI {gbp(eriPreview.g || 0)} taxed in {er.distributionDate ? ukTaxYear(er.distributionDate) : "—"}.</p>
+        )}
+        {eriEntries.length > 0 && (
+          <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-[var(--panel2)] text-[var(--muted)]">
+                <tr>{["Fund", "Period end", "Dist. date", "Units", "ERI (GBP)", "Taxed as", "Tax year", ""].map((h, i) => <th key={i} className={"py-2 px-3 font-medium " + (i && i < 7 ? "text-right" : "text-left")}>{h}</th>)}</tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border)]">
+                {eriEntries.slice().sort((a, b) => (a.distributionDate < b.distributionDate ? 1 : -1)).map((e) => {
+                  const t = eriTxns.find((x) => x.id === "eri-" + e.id);
+                  return (
+                    <tr key={e.id}>
+                      <td className="py-2 px-3 font-medium">{e.ticker}</td>
+                      <td className="py-2 px-3 num text-[var(--muted)]">{e.periodEnd}</td>
+                      <td className="py-2 px-3 num text-[var(--muted)]">{e.distributionDate}</td>
+                      <td className="py-2 px-3 text-right num">{t ? num(t._units, t._units % 1 ? 4 : 0) : "—"}</td>
+                      <td className="py-2 px-3 text-right num">{gbp(t ? t._gbp : 0)}</td>
+                      <td className="py-2 px-3 capitalize">{e.treatment}</td>
+                      <td className="py-2 px-3 num">{ukTaxYear(e.distributionDate)}</td>
+                      <td className="py-2 px-3 text-right"><button onClick={() => setEriEntries((p) => p.filter((x) => x.id !== e.id))} className="text-[var(--muted)] hover:text-[var(--loss)]"><Trash2 size={15} /></button></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+        <p className="text-xs text-[var(--muted)]">The base-cost uplift shows up automatically in Holdings and the CGT summary. ERI is added to the pool on the distribution date, so it only reduces gains on disposals after that date.</p>
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------- CGT tab ------------------------------ */
-function CgtTab({ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried }) {
+function CgtTab({ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried, carryForward }) {
   if (!taxYears.length) return <Empty msg="No disposals yet. Add or import transactions to see a CGT position." />;
   return (
     <div className="space-y-5">
@@ -364,7 +748,7 @@ function CgtTab({ taxYears, activeYear, setYear, yearDisposals, liab, income, se
           </select>
         </Field>
         <Field label="Annual income before tax (£)"><input type="number" value={income} onChange={(e) => setIncome(+e.target.value || 0)} className="input num w-44" /></Field>
-        <Field label="Losses carried forward"><input type="number" value={carried} onChange={(e) => setCarried(+e.target.value || 0)} className="input num w-40" /></Field>
+        <Field label="Losses b/f (before tracked years)"><input type="number" value={carried} onChange={(e) => setCarried(+e.target.value || 0)} className="input num w-52" /></Field>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -381,6 +765,13 @@ function CgtTab({ taxYears, activeYear, setYear, yearDisposals, liab, income, se
       </div>
       <div className="text-xs text-[var(--muted)] num -mt-3">
         Income {gbp(income)} − personal allowance {gbp(liab.personalAllowance)} = taxable income {gbp(liab.taxableIncome)}; basic-rate band left for gains {gbp(Math.max(0, cfgFor(activeYear).basicLimit - liab.taxableIncome))}.
+      </div>
+      <div className="rounded-lg border border-[var(--border)] bg-[var(--panel2)] px-3 py-2 text-xs text-[var(--muted)] num -mt-1">
+        <span className="font-medium text-[var(--fg)]">Loss pool</span> — brought into {activeYear} {gbp(liab.carriedInto ?? carried)}
+        {liab.usedCarried ? ` · used ${gbp(liab.usedCarried)} (only down to the AEA)` : " · none used"}
+        {liab.inYearNetLoss ? ` · net loss realised this year ${gbp(liab.inYearNetLoss)}` : ""} · carried out {gbp(liab.carriedOut ?? carried)}.
+        {" "}Total unused losses across all tracked years: <span className="font-medium text-[var(--fg)]">{gbp(carryForward || 0)}</span>.
+        {carryForward > 0 ? " Remember losses must be claimed within 4 years of the tax year they arose." : ""}
       </div>
 
       {/* audit trail — the signature element */}
@@ -413,7 +804,8 @@ function CgtTab({ taxYears, activeYear, setYear, yearDisposals, liab, income, se
 }
 
 /* --------------------------- Ledger tab ----------------------------- */
-const BLANK = () => ({ id: uid(), date: todayISO(), ticker: "", side: "BUY", quantity: "", nativeCurrency: "GBP", nativeAmount: "", fxRate: 1, gbpAmount: "", note: "" });
+const BLANK = () => ({ id: uid(), date: todayISO(), ticker: "", side: "BUY", quantity: "", nativeCurrency: "GBP", nativeAmount: "", fxRate: 1, gbpAmount: "", wrapper: "GIA", note: "" });
+const WRAPPERS = ["GIA", "ISA", "SIPP", "LISA"];
 function LedgerTab({ txns, setTxns }) {
   const [draft, setDraft] = useState(BLANK());
   const [fxBusy, setFxBusy] = useState(false);
@@ -451,11 +843,14 @@ function LedgerTab({ txns, setTxns }) {
     <div className="space-y-4">
       {/* add row */}
       <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-3">
-        <div className="grid grid-cols-2 sm:grid-cols-8 gap-2 items-end">
+        <div className="grid grid-cols-2 sm:grid-cols-9 gap-2 items-end">
           <Field label="Date"><input type="date" value={draft.date} onChange={(e) => set("date", e.target.value)} className="input num w-full" /></Field>
           <Field label="Ticker"><input value={draft.ticker} onChange={(e) => set("ticker", e.target.value)} placeholder="WFC" className="input w-full" /></Field>
           <Field label="Side">
             <select value={draft.side} onChange={(e) => set("side", e.target.value)} className="input w-full"><option>BUY</option><option>SELL</option></select>
+          </Field>
+          <Field label="Wrapper">
+            <select value={draft.wrapper} onChange={(e) => set("wrapper", e.target.value)} className="input w-full">{WRAPPERS.map((w) => <option key={w}>{w}</option>)}</select>
           </Field>
           <Field label="Quantity"><input type="number" value={draft.quantity} onChange={(e) => set("quantity", e.target.value)} className="input num w-full" /></Field>
           <Field label="Ccy">
@@ -479,7 +874,7 @@ function LedgerTab({ txns, setTxns }) {
       <div className="rounded-xl border border-[var(--border)] overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-[var(--panel2)] text-[var(--muted)] text-xs uppercase tracking-wide">
-            <tr>{["Date", "Ticker", "Side", "Qty", "Native", "FX", "GBP", ""].map((h, i) => <th key={i} className={"px-3 py-2 font-medium " + (i >= 3 && i <= 6 ? "text-right" : "text-left")}>{h}</th>)}</tr>
+            <tr>{["Date", "Ticker", "Side", "Wrapper", "Qty", "Native", "FX", "GBP", ""].map((h, i) => <th key={i} className={"px-3 py-2 font-medium " + (i >= 4 && i <= 7 ? "text-right" : "text-left")}>{h}</th>)}</tr>
           </thead>
           <tbody className="divide-y divide-[var(--border)] bg-[var(--panel)]">
             {rows.map((t) => (
@@ -487,6 +882,7 @@ function LedgerTab({ txns, setTxns }) {
                 <td className="px-3 py-2 num">{t.date}</td>
                 <td className="px-3 py-2 font-medium">{t.ticker}</td>
                 <td className="px-3 py-2"><span className={"text-xs font-semibold " + (t.side === "BUY" ? "text-[var(--gain)]" : "text-[var(--loss)]")}>{t.side}</span></td>
+                <td className="px-3 py-2"><span className={"text-[10px] font-semibold px-1.5 py-0.5 rounded " + ((t.wrapper || "GIA") === "GIA" ? "bg-[var(--chip)] text-[var(--fg)]" : "bg-[color:color-mix(in_srgb,var(--gain)_18%,transparent)] text-[var(--gain)]")}>{t.wrapper || "GIA"}</span></td>
                 <td className="px-3 py-2 num text-right">{num(t.quantity, t.quantity % 1 ? 4 : 0)}</td>
                 <td className="px-3 py-2 num text-right text-[var(--muted)]">{t.nativeCurrency === "GBP" ? "—" : `${num(t.nativeAmount)} ${t.nativeCurrency}`}</td>
                 <td className="px-3 py-2 num text-right text-[var(--muted)]">{t.nativeCurrency === "GBP" ? "—" : num(t.fxRate, 4)}</td>
@@ -707,7 +1103,7 @@ function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvM
 }
 
 /* --------------------------- Planning tab --------------------------- */
-function PlanningTab({ pools, prices, setPrices, disposals, txns }) {
+function PlanningTab({ pools, prices, setPrices, disposals, txns, income }) {
   const yearNow = ukTaxYear(todayISO());
   const aea = aeaForYear(yearNow);
   const realised = disposals.filter((d) => d.taxYear === yearNow);
@@ -799,6 +1195,90 @@ function PlanningTab({ pools, prices, setPrices, disposals, txns }) {
       <p className="text-xs text-[var(--muted)]">
         The 30-day rule matches a disposal against any repurchase of the same security in the following 30 days before it touches the pool. To crystallise a pool gain (e.g. to use your allowance), avoid rebuying the same line within 30 days — buy a similar-but-not-identical fund, or repurchase inside an ISA/pension instead.
       </p>
+
+      <MultiYearOptimiser pools={pools} prices={prices} income={income} />
+    </div>
+  );
+}
+
+/* Multi-year gain-harvesting: stagger disposals to soak up each year's AEA
+   (and optionally basic-band room) and show how long an embedded gain takes to wash. */
+function MultiYearOptimiser({ pools, prices, income }) {
+  const yearNow = ukTaxYear(todayISO());
+  const [startYear, setStartYear] = useState(yearNow);
+  const [years, setYears] = useState(10);
+  const [useBasicBand, setUseBasicBand] = useState(false);
+  const [growth, setGrowth] = useState(0);
+
+  const startOpts = useMemo(() => { const a = []; let y = yearNow; for (let i = 0; i < 4; i++) { a.push(y); y = nextTaxYear(y); } return a; }, [yearNow]);
+  const holdings = useMemo(() => Object.keys(pools).filter((t) => pools[t].qty > 1e-6).map((t) => {
+    const { qty, cost } = pools[t]; const p = prices[t];
+    return { ticker: t, qty, cost, price: (p != null && p !== "" && !isNaN(+p)) ? +p : NaN };
+  }).filter((h) => isFinite(h.price) && h.price > 0), [pools, prices]);
+
+  const result = useMemo(() => {
+    if (!holdings.length) return null;
+    try { return optimiseDisposals({ holdings, startYear, years: Math.max(1, Math.min(40, +years || 1)), income: +income || 0, useBasicBand, growth: (+growth || 0) / 100 }); }
+    catch { return null; }
+  }, [holdings, startYear, years, income, useBasicBand, growth]);
+
+  const priced = holdings.length;
+  const totalTax = result ? result.schedule.reduce((s, r) => s + r.tax, 0) : 0;
+
+  return (
+    <div className="space-y-3 pt-2">
+      <h3 className="text-sm font-semibold flex items-center gap-2"><Wand2 size={15} /> Multi-year disposal optimiser</h3>
+      <p className="text-xs text-[var(--muted)]">
+        Staggers sales across tax years to harvest gains up to each year's annual exempt amount (tax-free){useBasicBand ? ", plus basic-rate band room at 18%," : ""} then resets base cost by rebuying at market (bed-&amp;-ISA or bed-&amp;-spouse to sidestep the 30-day rule). Uses your {priced} priced GIA holding{priced === 1 ? "" : "s"}.
+      </p>
+
+      <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-3">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 items-end">
+          <Field label="Start tax year"><select value={startYear} onChange={(e) => setStartYear(e.target.value)} className="input w-full">{startOpts.map((y) => <option key={y}>{y}</option>)}</select></Field>
+          <Field label="Horizon (years)"><input type="number" min="1" max="40" value={years} onChange={(e) => setYears(e.target.value)} className="input num w-full" /></Field>
+          <Field label="Assumed growth %/yr"><input type="number" step="0.5" value={growth} onChange={(e) => setGrowth(e.target.value)} className="input num w-full" /></Field>
+          <label className="flex items-center gap-2 text-sm cursor-pointer pb-2"><input type="checkbox" checked={useBasicBand} onChange={(e) => setUseBasicBand(e.target.checked)} className="accent-[var(--accent)]" /> Use basic-rate band (18%)</label>
+        </div>
+      </div>
+
+      {!priced && <Empty msg="Set current prices on the holdings above (or the Holdings tab) to run the optimiser." />}
+
+      {result && priced > 0 && (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <Stat label="Embedded gain now" value={gbp(result.startEmbedded)} tone={result.startEmbedded >= 0 ? "gain" : "loss"} />
+            <Stat label={useBasicBand ? "Gain washed over horizon" : "Gain washed tax-free"} value={gbp(result.totalWashed)} big tone="gain" />
+            <Stat label="Years to clear" value={result.yearsToClear ? `${result.yearsToClear}` : `>${years}`} sub={result.yearsToClear ? "" : "still embedded gain left"} />
+            <Stat label="Tax over plan" value={gbp(totalTax)} tone={totalTax > 0 ? "loss" : undefined} sub={useBasicBand ? "basic-band 18%" : "within AEA"} />
+          </div>
+
+          <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-[var(--panel2)] text-[var(--muted)] text-xs uppercase tracking-wide">
+                <tr>{["Tax year", "Harvest", "AEA used", "Tax", "Sell", "Cumulative washed", "Gain still embedded"].map((h, i) => (
+                  <th key={i} className={"px-3 py-2 font-medium " + (i === 0 || i === 4 ? "text-left" : "text-right")}>{h}</th>
+                ))}</tr>
+              </thead>
+              <tbody className="divide-y divide-[var(--border)] bg-[var(--panel)]">
+                {result.schedule.map((r) => (
+                  <tr key={r.year} className="hover:bg-[var(--panel2)]">
+                    <td className="px-3 py-2 num font-medium">{r.year}</td>
+                    <td className="px-3 py-2 num text-right">{gbp(r.gainRealised)}</td>
+                    <td className="px-3 py-2 num text-right text-[var(--muted)]">{gbp(r.aeaUsed).replace(".00", "")}</td>
+                    <td className={"px-3 py-2 num text-right " + (r.tax > 0 ? "text-[var(--loss)]" : "text-[var(--muted)]")}>{r.tax > 0 ? gbp(r.tax) : "—"}</td>
+                    <td className="px-3 py-2 text-[var(--muted)] text-xs">{r.sells.map((s) => `${num(s.shares, s.shares % 1 ? 2 : 0)} ${s.ticker}`).join(", ") || "—"}</td>
+                    <td className="px-3 py-2 num text-right text-[var(--muted)]">{gbp(r.cumulativeWashed)}</td>
+                    <td className="px-3 py-2 num text-right">{gbp(r.remainingUnrealised)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-[var(--muted)]">
+            Each year's harvest sells the highest gain-per-share holdings first and assumes you rebuy at the same price to reset base cost. Growth compounds the price of unsold shares. This models the CGT wash only — dealing costs, spreads and stamp duty on rebuys aren't included, and a bed-&amp;-ISA rebuy also consumes ISA allowance.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -1006,83 +1486,170 @@ function WhatIfTab({ pools, disposals, income, carried, prices = {} }) {
 
 /* --------------------------- Import tab ----------------------------- */
 const FIELDS = ["date", "ticker", "side", "quantity", "nativeCurrency", "nativeAmount", "fxRate", "gbpAmount"];
-function ImportTab({ setTxns, setTab }) {
+function ImportTab({ setTxns, setTab, setIncomeEntries }) {
+  const [mode, setMode] = useState("ibkr");
+  const [wrapper, setWrapper] = useState("GIA");
   const [raw, setRaw] = useState("");
   const [parsed, setParsed] = useState(null);
   const [map, setMap] = useState({});
+  const [ib, setIb] = useState(null);       // parseIBKR result
+  const [importing, setImporting] = useState(false);
+  const [note, setNote] = useState("");
 
+  const readFile = (e, cb) => { const f = e.target.files?.[0]; if (!f) return; const r = new FileReader(); r.onload = () => cb(String(r.result)); r.readAsText(f); e.target.value = ""; };
+
+  // ---- IBKR ----
+  const parseIb = (text) => { const t = (text ?? raw).trim(); if (!t) return; setIb(parseIBKR(t, { defaultWrapper: wrapper })); };
+  React.useEffect(() => { if (ib) setIb((r) => ({ ...r, trades: r.trades.map((t) => ({ ...t, wrapper })), income: r.income.map((t) => ({ ...t, wrapper })) })); }, [wrapper]); // eslint-disable-line
+  const doImportIb = async () => {
+    if (!ib) return; setImporting(true); setNote("");
+    const cache = {};
+    const resolve = async (row, gbpKey) => {
+      if (!row.needsFx) return;
+      const k = row.nativeCurrency + row.date;
+      if (!(k in cache)) cache[k] = await fxHistorical(row.nativeCurrency, row.date);
+      const fx = cache[k];
+      if (fx) { row.fxRate = fx; row[gbpKey] = Math.round(row.nativeAmount * fx * 100) / 100; }
+    };
+    const trades = ib.trades.map((t) => ({ ...t })), income = ib.income.map((t) => ({ ...t }));
+    for (const t of trades) await resolve(t, "gbpAmount");
+    for (const t of income) await resolve(t, "amount");
+    const newTxns = trades.filter((t) => t.gbpAmount != null).map((t) => ({ id: uid(), date: t.date, ticker: t.ticker, isin: t.isin, side: t.side, quantity: t.quantity, nativeCurrency: t.nativeCurrency, nativeAmount: t.nativeAmount, fxRate: t.fxRate || 1, gbpAmount: t.gbpAmount, wrapper: t.wrapper, note: "IBKR import" }));
+    const newIncome = income.filter((t) => t.amount != null).map((t) => ({ id: uid(), date: t.date, ticker: t.ticker, kind: t.kind, amount: t.amount, wrapper: t.wrapper, note: "IBKR import" }));
+    const skipped = (trades.length - newTxns.length) + (income.length - newIncome.length);
+    setTxns((p) => [...p, ...newTxns]);
+    if (newIncome.length) setIncomeEntries((p) => [...p, ...newIncome]);
+    setImporting(false);
+    if (skipped) { setNote(`Imported ${newTxns.length} trades and ${newIncome.length} income rows. ${skipped} row(s) skipped — FX could not be resolved; add them manually.`); }
+    else setTab(newTxns.length ? "ledger" : "income");
+  };
+
+  // ---- generic ----
   const parse = () => {
     const res = Papa.parse(raw.trim(), { header: true, skipEmptyLines: true });
     if (!res.data?.length) return;
     const cols = res.meta.fields || [];
-    const guess = {};
     const find = (re) => cols.find((c) => re.test(c));
-    guess.date = find(/date|trade date|settl/i);
-    guess.ticker = find(/ticker|symbol|instrument|stock/i);
-    guess.side = find(/side|action|type|buy.?sell|b\/s/i);
-    guess.quantity = find(/qty|quantity|shares|units/i);
-    guess.nativeCurrency = find(/currency|ccy/i);
-    guess.nativeAmount = find(/amount|proceeds|cost|value|consideration|net/i);
-    guess.fxRate = find(/fx|rate|exchange/i);
-    guess.gbpAmount = find(/gbp|sterling/i);
+    const guess = {};
+    guess.date = find(/date|trade date|settl/i); guess.ticker = find(/ticker|symbol|instrument|stock/i);
+    guess.side = find(/side|action|type|buy.?sell|b\/s/i); guess.quantity = find(/qty|quantity|shares|units/i);
+    guess.nativeCurrency = find(/currency|ccy/i); guess.nativeAmount = find(/amount|proceeds|cost|value|consideration|net/i);
+    guess.fxRate = find(/fx|rate|exchange/i); guess.gbpAmount = find(/gbp|sterling/i);
     setParsed(res.data); setMap(guess);
   };
-
   const normSide = (v) => /sell|^s$|sld|disp/i.test(v || "") ? "SELL" : "BUY";
-  const preview = useMemo(() => {
-    if (!parsed) return [];
-    return parsed.slice(0, 5).map((r) => mapRow(r, map, normSide));
-  }, [parsed, map]);
-
+  const preview = useMemo(() => (!parsed ? [] : parsed.slice(0, 5).map((r) => mapRow(r, map, normSide, wrapper))), [parsed, map, wrapper]);
   const doImport = () => {
-    const rows = parsed.map((r) => mapRow(r, map, normSide)).filter((t) => t.date && t.ticker && +t.quantity > 0);
+    const rows = parsed.map((r) => mapRow(r, map, normSide, wrapper)).filter((t) => t.date && t.ticker && +t.quantity > 0);
     setTxns((p) => [...p, ...rows]); setTab("ledger");
   };
 
+  const Tab = ({ k, label }) => (
+    <button onClick={() => setMode(k)} className={"px-3 py-1.5 text-sm rounded-lg border " + (mode === k ? "bg-[var(--accent)] text-[var(--accent-fg)] border-transparent" : "border-[var(--border)] text-[var(--muted)] hover:text-[var(--fg)]")}>{label}</button>
+  );
+
   return (
     <div className="space-y-4">
-      <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
-        <p className="text-sm text-[var(--muted)]">Paste a CSV export from Interactive Brokers, Fidelity, or any broker. Columns are auto-mapped — adjust below if needed.</p>
-        <textarea value={raw} onChange={(e) => setRaw(e.target.value)} rows={5} placeholder="Date,Symbol,Action,Quantity,Currency,Amount,FXRate&#10;2025-06-02,WFC,SELL,200,USD,18718,0.78" className="input num w-full font-mono text-xs" />
-        <button onClick={parse} className="btn-accent"><Wand2 size={15} /> Parse & map</button>
+      <div className="flex items-center gap-2 flex-wrap">
+        <Tab k="ibkr" label="Interactive Brokers" /><Tab k="generic" label="Generic CSV" />
+        <span className="ml-auto" />
+        <Field label="Import into wrapper"><select value={wrapper} onChange={(e) => setWrapper(e.target.value)} className="input">{WRAPPERS.map((w) => <option key={w}>{w}</option>)}</select></Field>
       </div>
 
-      {parsed && (
-        <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-            {FIELDS.map((f) => (
-              <Field key={f} label={f}>
-                <select value={map[f] || ""} onChange={(e) => setMap((m) => ({ ...m, [f]: e.target.value }))} className="input w-full text-xs">
-                  <option value="">—</option>
-                  {(Object.keys(parsed[0] || {})).map((c) => <option key={c}>{c}</option>)}
-                </select>
-              </Field>
-            ))}
+      {mode === "ibkr" && (
+        <>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+            <p className="text-sm text-[var(--muted)]">Paste (or upload) an IBKR <strong>Flex Query</strong> CSV or an <strong>Activity Statement</strong> CSV. Trades and dividends/interest are both picked up. A Flex query carries an FX-to-base rate, so GBP conversion is automatic; Activity exports lack it, so non-GBP rows are converted by trade-date FX on import. {wrapper !== "GIA" && <span className="text-[var(--fg)]">Note: {wrapper} is tax-sheltered, so these rows won't affect CGT or income tax.</span>}</p>
+            <textarea value={raw} onChange={(e) => setRaw(e.target.value)} rows={5} placeholder={'Symbol,ISIN,TradeDate,Buy/Sell,Quantity,TradePrice,Proceeds,IBCommission,CurrencyPrimary,FXRateToBase,AssetClass\nAAPL,US0378331005,20240115,BUY,10,180,-1800,-1,USD,0.79,STK'} className="input num w-full font-mono text-xs" />
+            <div className="flex items-center gap-2">
+              <button onClick={() => parseIb()} className="btn-accent"><Wand2 size={15} /> Parse</button>
+              <label className="text-sm text-[var(--accent)] cursor-pointer flex items-center gap-1"><Upload size={14} /> Upload CSV<input type="file" accept=".csv,text/csv" className="hidden" onChange={(e) => readFile(e, (txt) => { setRaw(txt); parseIb(txt); })} /></label>
+            </div>
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-xs">
-              <thead className="text-[var(--muted)]"><tr>{["date", "ticker", "side", "qty", "ccy", "native", "fx", "gbp"].map((h) => <th key={h} className="px-2 py-1 text-left">{h}</th>)}</tr></thead>
-              <tbody className="num">
-                {preview.map((t, i) => (
-                  <tr key={i} className="border-t border-[var(--border)]">
-                    <td className="px-2 py-1">{t.date}</td><td className="px-2 py-1">{t.ticker}</td><td className="px-2 py-1">{t.side}</td>
-                    <td className="px-2 py-1">{t.quantity}</td><td className="px-2 py-1">{t.nativeCurrency}</td><td className="px-2 py-1">{num(t.nativeAmount)}</td>
-                    <td className="px-2 py-1">{num(t.fxRate, 4)}</td><td className="px-2 py-1">{gbp(t.gbpAmount)}</td>
-                  </tr>
+
+          {ib && (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+              <div className="flex items-center gap-4 text-sm flex-wrap">
+                <span className="font-semibold">{ib.format === "activity" ? "Activity Statement" : "Flex Query"} detected</span>
+                <span className="num">{ib.trades.length} trades</span>
+                <span className="num">{ib.income.filter((i) => i.kind === "dividend").length} dividends</span>
+                <span className="num">{ib.income.filter((i) => i.kind === "interest").length} interest</span>
+              </div>
+              {ib.warnings.map((w, i) => (
+                <div key={i} className="flex items-start gap-2 text-xs rounded-lg px-3 py-2 text-[var(--loss)]" style={{ background: "color-mix(in srgb, var(--loss) 10%, transparent)" }}><AlertTriangle size={14} className="mt-0.5 shrink-0" />{w}</div>
+              ))}
+              {ib.trades.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="text-[var(--muted)]"><tr>{["date", "ticker", "side", "qty", "ccy", "native", "GBP"].map((h) => <th key={h} className="px-2 py-1 text-left">{h}</th>)}</tr></thead>
+                    <tbody className="num">
+                      {ib.trades.slice(0, 6).map((t, i) => (
+                        <tr key={i} className="border-t border-[var(--border)]">
+                          <td className="px-2 py-1">{t.date}</td><td className="px-2 py-1">{t.ticker}</td><td className="px-2 py-1">{t.side}</td>
+                          <td className="px-2 py-1">{num(t.quantity, t.quantity % 1 ? 4 : 0)}</td><td className="px-2 py-1">{t.nativeCurrency}</td>
+                          <td className="px-2 py-1">{num(t.nativeAmount)}</td><td className="px-2 py-1">{t.gbpAmount == null ? "FX on import" : gbp(t.gbpAmount)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {ib.trades.length > 6 && <p className="text-xs text-[var(--muted)] mt-1">+{ib.trades.length - 6} more…</p>}
+                </div>
+              )}
+              {note && <div className="text-xs text-[var(--muted)]">{note}</div>}
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[var(--muted)]">Imports into <strong>{wrapper}</strong>. Trades → ledger, dividends/interest → Income tab.</span>
+                <button onClick={doImportIb} disabled={importing} className="btn-accent">{importing ? <RefreshCw size={15} className="animate-spin" /> : <FileUp size={15} />} Import</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {mode === "generic" && (
+        <>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+            <p className="text-sm text-[var(--muted)]">Paste a CSV from any broker. Columns are auto-mapped — adjust below if needed. Rows import into <strong>{wrapper}</strong>.</p>
+            <textarea value={raw} onChange={(e) => setRaw(e.target.value)} rows={5} placeholder="Date,Symbol,Action,Quantity,Currency,Amount,FXRate&#10;2025-06-02,WFC,SELL,200,USD,18718,0.78" className="input num w-full font-mono text-xs" />
+            <button onClick={parse} className="btn-accent"><Wand2 size={15} /> Parse & map</button>
+          </div>
+          {parsed && (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {FIELDS.map((f) => (
+                  <Field key={f} label={f}>
+                    <select value={map[f] || ""} onChange={(e) => setMap((m) => ({ ...m, [f]: e.target.value }))} className="input w-full text-xs">
+                      <option value="">—</option>
+                      {(Object.keys(parsed[0] || {})).map((c) => <option key={c}>{c}</option>)}
+                    </select>
+                  </Field>
                 ))}
-              </tbody>
-            </table>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-[var(--muted)]">{parsed.length} rows ready. GBP fills from native × FX when GBP column is unmapped.</span>
-            <button onClick={doImport} className="btn-accent"><FileUp size={15} /> Import {parsed.length} rows</button>
-          </div>
-        </div>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-[var(--muted)]"><tr>{["date", "ticker", "side", "qty", "ccy", "native", "fx", "gbp"].map((h) => <th key={h} className="px-2 py-1 text-left">{h}</th>)}</tr></thead>
+                  <tbody className="num">
+                    {preview.map((t, i) => (
+                      <tr key={i} className="border-t border-[var(--border)]">
+                        <td className="px-2 py-1">{t.date}</td><td className="px-2 py-1">{t.ticker}</td><td className="px-2 py-1">{t.side}</td>
+                        <td className="px-2 py-1">{t.quantity}</td><td className="px-2 py-1">{t.nativeCurrency}</td><td className="px-2 py-1">{num(t.nativeAmount)}</td>
+                        <td className="px-2 py-1">{num(t.fxRate, 4)}</td><td className="px-2 py-1">{gbp(t.gbpAmount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[var(--muted)]">{parsed.length} rows ready. GBP fills from native × FX when GBP column is unmapped.</span>
+                <button onClick={doImport} className="btn-accent"><FileUp size={15} /> Import {parsed.length} rows</button>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
 }
-function mapRow(r, map, normSide) {
+function mapRow(r, map, normSide, wrapper) {
   const g = (f) => (map[f] ? r[map[f]] : "");
   const ccy = (g("nativeCurrency") || "GBP").toUpperCase().trim();
   const native = parseFloat(String(g("nativeAmount")).replace(/[^0-9.\-]/g, "")) || 0;
@@ -1093,7 +1660,7 @@ function mapRow(r, map, normSide) {
   return {
     id: uid(), date: (g("date") || "").slice(0, 10), ticker: (g("ticker") || "").toUpperCase().trim(),
     side: normSide(g("side")), quantity: Math.abs(parseFloat(g("quantity")) || 0),
-    nativeCurrency: ccy, nativeAmount: native, fxRate: fx || 1, gbpAmount: gbpA, note: "imported",
+    nativeCurrency: ccy, nativeAmount: native, fxRate: fx || 1, gbpAmount: gbpA, wrapper: wrapper || "GIA", note: "imported",
   };
 }
 
