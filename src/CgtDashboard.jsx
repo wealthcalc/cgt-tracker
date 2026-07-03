@@ -172,8 +172,9 @@ function liabilityAllYears(disposals, { incomeByYear = {}, initialCarried = 0 } 
   }
   return { years, results, carriedForward: carried };
 }
-const unitsHeldAt = (txns, dateStr) => {
-  let q = 0; for (const t of txns) if ((t.side === "BUY" || t.side === "SELL") && t.date <= dateStr) q += (t.side === "BUY" ? 1 : -1) * t.quantity; return q;
+const unitsHeldAt = (txns, dateStr, ticker) => {
+  const want = ticker ? String(ticker).toUpperCase() : null;
+  let q = 0; for (const t of txns) { if (t.side !== "BUY" && t.side !== "SELL") continue; if (want && String(t.ticker || "").toUpperCase() !== want) continue; if (t.date <= dateStr) q += (t.side === "BUY" ? 1 : -1) * t.quantity; } return q;
 };
 
 /* ---- UK income tax on investment income (dividends + interest), stacked on
@@ -352,6 +353,31 @@ function optimiseDisposals({ holdings, startYear, years = 10, income = 0, useBas
   return { schedule, yearsToClear, totalWashed: Math.round(totalWashed * 100) / 100, startEmbedded: Math.round(startEmbedded * 100) / 100, remainingAfter: Math.round(embedded() * 100) / 100 };
 }
 
+// Seed ISIN/domicile data for holdings, sourced from issuer fact sheets. Only
+// covers tickers actually held (per the 2026-07 GIA ledger import); anything
+// else is left blank for the user to fill in. `eri` flags offshore reporting
+// funds (Irish/Lux-domiciled accumulating ETFs) that generate excess reportable
+// income when held unsheltered; UK investment trusts are ordinary companies and
+// pay ordinary dividends, not ERI, even though they accumulate/reinvest.
+const SECURITY_SEED = {
+  SJPA: { isin: "IE00B4L5YX21", name: "iShares Core MSCI Japan IMI UCITS ETF (Acc)", domicile: "IE", eri: true },
+  CSP1: { isin: "IE00B5BMR087", name: "iShares Core S&P 500 UCITS ETF (Acc)", domicile: "IE", eri: true },
+  EMIM: { isin: "IE00BKM4GZ66", name: "iShares Core MSCI EM IMI UCITS ETF (Acc)", domicile: "IE", eri: true },
+  XNAQ: { isin: "IE00BMFKG444", name: "Xtrackers Nasdaq 100 UCITS ETF 1C", domicile: "IE", eri: true },
+  UIFS: { isin: "IE00B4JNQZ49", name: "iShares S&P 500 Financials Sector UCITS ETF (Acc)", domicile: "IE", eri: true },
+  HSTC: { isin: "IE00BMWXKN31", name: "HSBC Hang Seng TECH UCITS ETF", domicile: "IE", eri: true },
+  IITU: { isin: "IE00B3WJKG14", name: "iShares S&P 500 Information Technology Sector UCITS ETF (Acc)", domicile: "IE", eri: true },
+  SPXL: { isin: "IE000XZSV718", name: "SPDR S&P 500 UCITS ETF (Acc)", domicile: "IE", eri: true },
+  SMT: { isin: "GB00BLDYK618", name: "Scottish Mortgage Investment Trust plc", domicile: "GB", eri: false },
+  ATT: { isin: "GB00BNG2M159", name: "Allianz Technology Trust plc", domicile: "GB", eri: false },
+  BNKR: { isin: "GB00BN4NDR39", name: "Bankers Investment Trust plc", domicile: "GB", eri: false },
+  AIAG: { isin: "IE00BK5BCD43", name: "iShares AI & Automation Growth UCITS ETF", domicile: "IE", eri: true },
+  CYSE: { isin: "IE00BLPK3577", name: "iShares Cybersecurity UCITS ETF", domicile: "IE", eri: true },
+  DFEU: { isin: "IE000IAXNM41", name: "Defense Europe UCITS ETF", domicile: "IE", eri: true },
+  RBTX: { isin: "IE00BYZK4552", name: "iShares Robotics & Automation UCITS ETF", domicile: "IE", eri: true },
+  RENG: { isin: "IE00BK5BCH80", name: "iShares Renewable Energy UCITS ETF", domicile: "IE", eri: true },
+};
+
 /* ----------------------------- helpers ------------------------------ */
 const round4 = (x) => Math.round(x * 1e4) / 1e4;
 const gbp = (x) => (x < 0 ? "−£" : "£") + Math.abs(x).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -418,6 +444,7 @@ export default function App() {
   const [avKey, setAvKey] = useState(() => store.get("cgt.avkey", ""));
   const [avMeta, setAvMeta] = useState(() => store.get("cgt.avmeta", {}));       // { ticker: {symbol, currency} }
   const [priceMeta, setPriceMeta] = useState(() => store.get("cgt.pricemeta", {})); // { ticker: {asOf, raw, ccy} }
+  const [secMeta, setSecMeta] = useState(() => ({ ...SECURITY_SEED, ...store.get("cgt.secmeta", {}) })); // { ticker: {isin, name, domicile, eri} }
   const [error, setError] = useState(null);
 
   // persist (guarded; no-ops in sandbox)
@@ -426,6 +453,7 @@ export default function App() {
   React.useEffect(() => store.set("cgt.avkey", avKey), [avKey]);
   React.useEffect(() => store.set("cgt.avmeta", avMeta), [avMeta]);
   React.useEffect(() => store.set("cgt.pricemeta", priceMeta), [priceMeta]);
+  React.useEffect(() => store.set("cgt.secmeta", secMeta), [secMeta]);
   React.useEffect(() => store.set("cgt.income", income), [income]);
   React.useEffect(() => store.set("cgt.carried", carried), [carried]);
   React.useEffect(() => store.set("cgt.incomeEntries", incomeEntries), [incomeEntries]);
@@ -439,7 +467,7 @@ export default function App() {
 
   // Excess reportable income -> synthetic ERI txns (pool cost uplift) + income.
   const eriTxns = useMemo(() => eriEntries.map((e) => {
-    const units = unitsHeldAt(giaTxns, e.periodEnd || "9999-12-31");
+    const units = unitsHeldAt(giaTxns, e.periodEnd || "9999-12-31", e.ticker);
     const native = units * (+e.perShare || 0);
     const g = e.currency === "GBp" ? native / 100 : e.currency === "GBP" ? native : native * (+e.fxRate || 0);
     return { id: "eri-" + e.id, ticker: e.ticker, side: "ERI", date: e.distributionDate, quantity: 0, gbpAmount: Math.round((g || 0) * 100) / 100, _eri: e, _units: units, _gbp: g || 0 };
@@ -572,8 +600,8 @@ export default function App() {
 
           <div className="mt-5">
             {tab === "cgt" && <CgtTab {...{ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried, carryForward: allYears.carriedForward }} />}
-            {tab === "income" && <IncomeTab {...{ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns }} />}
-            {tab === "holdings" && <HoldingsTab {...{ pools: matched.pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns }} />}
+            {tab === "income" && <IncomeTab {...{ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns: giaTxns }} />}
+            {tab === "holdings" && <HoldingsTab {...{ pools: matched.pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns: giaTxns, secMeta, setSecMeta }} />}
             {tab === "planning" && <PlanningTab {...{ pools: matched.pools, prices, setPrices, disposals: matched.disposals, txns: giaTxns, income }} />}
             {tab === "report" && <ReportTab {...{ taxYears, disposals: matched.disposals, income, carried }} />}
             {tab === "ledger" && <LedgerTab {...{ txns, setTxns }} />}
@@ -611,7 +639,7 @@ function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries,
     setFxBusy(false);
   };
   const eriPreview = (() => {
-    const units = unitsHeldAt(txns, er.periodEnd || "9999-12-31");
+    const units = unitsHeldAt(txns, er.periodEnd || "9999-12-31", er.ticker);
     const native = units * (+er.perShare || 0);
     const g = er.currency === "GBp" ? native / 100 : er.currency === "GBP" ? native : native * (+er.fxRate || 0);
     return { units, g };
@@ -1038,9 +1066,11 @@ function LivePricesPanel({ tickers, avKey, setAvKey, avMeta, setAvMeta, prices, 
 }
 
 /* --------------------------- Holdings tab --------------------------- */
-function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns }) {
+function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns, secMeta, setSecMeta }) {
   const tickers = Object.keys(pools).filter((t) => pools[t].qty > 1e-6).sort();
   if (!tickers.length) return <Empty msg="No open holdings yet. Add buy transactions to see your positions and unrealised gains." />;
+
+  const setISIN = (tk, v) => setSecMeta((m) => ({ ...m, [tk]: { ...m[tk], isin: v.toUpperCase().trim() } }));
 
   const rows = tickers.map((tk) => {
     const { qty, cost } = pools[tk];
@@ -1049,12 +1079,13 @@ function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvM
     const hasP = price !== "" && !isNaN(+price);
     const value = hasP ? qty * +price : null;
     const unreal = hasP ? value - cost : null;
-    return { tk, qty, cost, avg, price, value, unreal, pct: hasP && cost ? (unreal / cost) * 100 : null };
+    return { tk, qty, cost, avg, price, value, unreal, pct: hasP && cost ? (unreal / cost) * 100 : null, sec: secMeta[tk] || {} };
   });
   const priced = rows.filter((r) => r.value != null);
   const totCost = priced.reduce((s, r) => s + r.cost, 0);
   const totValue = priced.reduce((s, r) => s + r.value, 0);
   const totUnreal = totValue - totCost;
+  const missingIsin = rows.filter((r) => !r.sec.isin).length;
 
   return (
     <div className="space-y-4">
@@ -1070,14 +1101,20 @@ function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvM
       <div className="rounded-xl border border-[var(--border)] overflow-hidden">
         <table className="w-full text-sm">
           <thead className="bg-[var(--panel2)] text-[var(--muted)] text-xs uppercase tracking-wide">
-            <tr>{["Ticker", "Quantity", "Avg cost", "Pool cost", "Price now", "Market value", "Unrealised", "%"].map((h, i) => (
-              <th key={i} className={"px-3 py-2 font-medium " + (i === 0 ? "text-left" : "text-right")}>{h}</th>
+            <tr>{["Ticker", "ISIN", "Quantity", "Avg cost", "Pool cost", "Price now", "Market value", "Unrealised", "%"].map((h, i) => (
+              <th key={i} className={"px-3 py-2 font-medium " + (i <= 1 ? "text-left" : "text-right")}>{h}</th>
             ))}</tr>
           </thead>
           <tbody className="divide-y divide-[var(--border)] bg-[var(--panel)]">
             {rows.map((r) => (
               <tr key={r.tk} className="hover:bg-[var(--panel2)]">
-                <td className="px-3 py-2 font-medium">{r.tk}</td>
+                <td className="px-3 py-2 font-medium">
+                  {r.tk}
+                  {r.sec.eri === true && <span title="Offshore reporting fund — generates excess reportable income (ERI) while held unsheltered" className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-[color:color-mix(in_srgb,var(--m-bb)_18%,transparent)] text-[var(--m-bb)] align-middle">ERI</span>}
+                </td>
+                <td className="px-3 py-2">
+                  <input value={r.sec.isin || ""} onChange={(e) => setISIN(r.tk, e.target.value)} placeholder="IE00…" className="input font-mono text-xs w-36 py-1" />
+                </td>
                 <td className="px-3 py-2 num text-right">{num(r.qty, r.qty % 1 ? 4 : 0)}</td>
                 <td className="px-3 py-2 num text-right text-[var(--muted)]">{gbp(r.avg)}</td>
                 <td className="px-3 py-2 num text-right">{gbp(r.cost)}</td>
@@ -1097,6 +1134,8 @@ function HoldingsTab({ pools, prices, setPrices, avKey, setAvKey, avMeta, setAvM
       <p className="text-xs text-[var(--muted)]">
         Enter each holding's current price per share in GBP, or fetch live prices above. Prices save locally on your device.
         Unrealised gain = current value − Section 104 pool cost; it's an indicator, not a taxable event until you sell.
+        {missingIsin > 0 && ` ISIN is set for ${rows.length - missingIsin}/${rows.length} holdings — it's the join key for matching issuer ERI reports, so fill in the rest when you get the chance.`}
+        {" "}The <span className="text-[var(--m-bb)] font-semibold">ERI</span> badge flags offshore reporting funds; UK investment trusts pay ordinary dividends instead and won't show it.
       </p>
     </div>
   );
