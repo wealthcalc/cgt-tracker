@@ -377,6 +377,18 @@ const SECURITY_SEED = {
   DFEU: { isin: "IE000IAXNM41", name: "Defense Europe UCITS ETF", domicile: "IE", eri: true },
   RBTX: { isin: "IE00BYZK4552", name: "iShares Robotics & Automation UCITS ETF", domicile: "IE", eri: true },
   RENG: { isin: "IE00BK5BCH80", name: "iShares Renewable Energy UCITS ETF", domicile: "IE", eri: true },
+  // Closed positions (fully disposed) — kept for ERI matching on the years they
+  // were actually held; a closed position can still owe ERI for any accounting
+  // period that fell inside its holding window.
+  SWDA: { isin: "IE00B4L5Y983", name: "iShares Core MSCI World UCITS ETF (Acc)", domicile: "IE", eri: true },
+  CNX1: { isin: "IE00B53SZB19", name: "iShares NASDAQ 100 UCITS ETF (Acc)", domicile: "IE", eri: true },
+  DGIT: { isin: "IE00BYZK4883", name: "iShares Digitalisation UCITS ETF (Acc)", domicile: "IE", eri: true },
+  USDV: { isin: "IE00B6YX5D40", name: "SPDR S&P US Dividend Aristocrats UCITS ETF (Dist)", domicile: "IE", eri: true },
+  // SAIC: ISIN not resolved — ticker doesn't match any confirmable LSE fund
+  // via web search. Add manually on the Holdings tab if you have the ISIN
+  // (e.g. from a contract note); until then it's excluded from ISIN-based
+  // ERI matching but the ERI coverage checker below will still flag it by
+  // ticker so it isn't silently missed.
 };
 
 /* ---- iShares/BlackRock "UK Reportable Income" workbook parser (one per fund
@@ -714,7 +726,7 @@ export default function App() {
 
           <div className="mt-5">
             {tab === "cgt" && <CgtTab {...{ taxYears, activeYear, setYear, yearDisposals, liab, income, setIncome, carried, setCarried, carryForward: allYears.carriedForward }} />}
-            {tab === "income" && <IncomeTab {...{ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns: giaTxns }} />}
+            {tab === "income" && <IncomeTab {...{ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns: giaTxns, secMeta, setSecMeta }} />}
             {tab === "holdings" && <HoldingsTab {...{ pools: matched.pools, prices, setPrices, avKey, setAvKey, avMeta, setAvMeta, priceMeta, setPriceMeta, txns: giaTxns, secMeta, setSecMeta }} />}
             {tab === "planning" && <PlanningTab {...{ pools: matched.pools, prices, setPrices, disposals: matched.disposals, txns: giaTxns, income }} />}
             {tab === "report" && <ReportTab {...{ taxYears, disposals: matched.disposals, income, carried }} />}
@@ -743,8 +755,18 @@ const addMonthsISO = (s, n) => {
 };
 const DIV_BLANK = () => ({ id: uid(), date: todayISO(), ticker: "", kind: "dividend", amount: "" });
 const ERI_BLANK = () => ({ id: uid(), ticker: "", periodEnd: "", distributionDate: "", perShare: "", currency: "GBp", fxRate: 1, treatment: "dividend" });
+const ERI_COLS = [
+  { label: "Fund", align: "left" },
+  { label: "Period end", align: "left" },
+  { label: "Dist. date", align: "left" },
+  { label: "Units", align: "right" },
+  { label: "ERI (GBP)", align: "right" },
+  { label: "Taxed as", align: "left" },
+  { label: "Tax year", align: "left" },
+  { label: "", align: "right" },
+];
 
-function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns }) {
+function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries, eriTxns, incomeByYear, income, setIncome, txns, secMeta, setSecMeta }) {
   const [dv, setDv] = useState(DIV_BLANK());
   const [er, setEr] = useState(ERI_BLANK());
   const [fxBusy, setFxBusy] = useState(false);
@@ -857,21 +879,21 @@ function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries,
           <div className="rounded-xl border border-[var(--border)] overflow-hidden">
             <table className="w-full text-sm">
               <thead className="bg-[var(--panel2)] text-[var(--muted)]">
-                <tr>{["Fund", "Period end", "Dist. date", "Units", "ERI (GBP)", "Taxed as", "Tax year", ""].map((h, i) => <th key={i} className={"py-2 px-3 font-medium " + (i && i < 7 ? "text-right" : "text-left")}>{h}</th>)}</tr>
+                <tr>{ERI_COLS.map((c, i) => <th key={i} className={"py-2 px-3 font-medium text-" + c.align}>{c.label}</th>)}</tr>
               </thead>
               <tbody className="divide-y divide-[var(--border)]">
                 {eriEntries.slice().sort((a, b) => (a.distributionDate < b.distributionDate ? 1 : -1)).map((e) => {
                   const t = eriTxns.find((x) => x.id === "eri-" + e.id);
                   return (
                     <tr key={e.id}>
-                      <td className="py-2 px-3 font-medium">{e.ticker}</td>
-                      <td className="py-2 px-3 num text-[var(--muted)]">{e.periodEnd}</td>
-                      <td className="py-2 px-3 num text-[var(--muted)]">{e.distributionDate}</td>
-                      <td className="py-2 px-3 text-right num">{t ? num(t._units, t._units % 1 ? 4 : 0) : "—"}</td>
-                      <td className="py-2 px-3 text-right num">{gbp(t ? t._gbp : 0)}</td>
-                      <td className="py-2 px-3 capitalize">{e.treatment}</td>
-                      <td className="py-2 px-3 num">{ukTaxYear(e.distributionDate)}</td>
-                      <td className="py-2 px-3 text-right"><button onClick={() => setEriEntries((p) => p.filter((x) => x.id !== e.id))} className="text-[var(--muted)] hover:text-[var(--loss)]"><Trash2 size={15} /></button></td>
+                      <td className={"py-2 px-3 font-medium text-" + ERI_COLS[0].align}>{e.ticker}</td>
+                      <td className={"py-2 px-3 num text-[var(--muted)] text-" + ERI_COLS[1].align}>{e.periodEnd}</td>
+                      <td className={"py-2 px-3 num text-[var(--muted)] text-" + ERI_COLS[2].align}>{e.distributionDate}</td>
+                      <td className={"py-2 px-3 num text-" + ERI_COLS[3].align}>{t ? num(t._units, t._units % 1 ? 4 : 0) : "—"}</td>
+                      <td className={"py-2 px-3 num text-" + ERI_COLS[4].align}>{gbp(t ? t._gbp : 0)}</td>
+                      <td className={"py-2 px-3 capitalize text-" + ERI_COLS[5].align}>{e.treatment}</td>
+                      <td className={"py-2 px-3 num text-" + ERI_COLS[6].align}>{ukTaxYear(e.distributionDate)}</td>
+                      <td className={"py-2 px-3 text-" + ERI_COLS[7].align}><button onClick={() => setEriEntries((p) => p.filter((x) => x.id !== e.id))} className="text-[var(--muted)] hover:text-[var(--loss)]"><Trash2 size={15} /></button></td>
                     </tr>
                   );
                 })}
@@ -880,7 +902,97 @@ function IncomeTab({ incomeEntries, setIncomeEntries, eriEntries, setEriEntries,
           </div>
         )}
         <p className="text-xs text-[var(--muted)]">The base-cost uplift shows up automatically in Holdings and the CGT summary. ERI is added to the pool on the distribution date, so it only reduces gains on disposals after that date.</p>
+
+        <EriCoverage {...{ txns, eriEntries, secMeta, setSecMeta }} />
       </div>
+    </div>
+  );
+}
+
+// For each fund ever held in the GIA (open or fully closed), shows the
+// holding window and which calendar years have a recorded ERI entry —
+// closed positions are included, since a fund owes ERI for every accounting
+// period that fell inside the time it was actually held, not just while
+// still open. Funds with no ISIN on record (so ERI-relevance is unknown)
+// are flagged for review rather than silently skipped.
+function EriCoverage({ txns, eriEntries, secMeta, setSecMeta }) {
+  const rows = useMemo(() => {
+    const byTicker = {};
+    for (const t of txns) {
+      if (t.side !== "BUY" && t.side !== "SELL") continue;
+      (byTicker[t.ticker] ||= []).push(t);
+    }
+    const today = todayISO();
+    return Object.entries(byTicker).map(([ticker, list]) => {
+      list.sort((a, b) => (a.date < b.date ? -1 : 1));
+      let qty = 0, firstBuy = null, lastZero = null;
+      for (const t of list) {
+        if (firstBuy === null && t.side === "BUY") firstBuy = t.date;
+        qty += (t.side === "BUY" ? 1 : -1) * t.quantity;
+        if (Math.abs(qty) < 1e-6) lastZero = t.date;
+      }
+      const open = qty > 1e-6;
+      const endDate = open ? today : (lastZero || list[list.length - 1].date);
+      const startYear = +firstBuy.slice(0, 4), endYear = +endDate.slice(0, 4);
+      const years = []; for (let y = startYear; y <= endYear; y++) years.push(y);
+      const sec = secMeta[ticker];
+      const eriYears = new Set(eriEntries.filter((e) => e.ticker === ticker && e.periodEnd).map((e) => +e.periodEnd.slice(0, 4)));
+      const missing = sec?.eri === true ? years.filter((y) => !eriYears.has(y)) : [];
+      return { ticker, firstBuy, endDate, open, years, eriYears: [...eriYears].sort(), missing, sec };
+    }).sort((a, b) => a.ticker.localeCompare(b.ticker));
+  }, [txns, eriEntries, secMeta]);
+
+  const setISIN = (tk, v) => setSecMeta((m) => ({ ...m, [tk]: { ...m[tk], isin: v.toUpperCase().trim() } }));
+  const setEri = (tk, v) => setSecMeta((m) => ({ ...m, [tk]: { ...m[tk], eri: v } }));
+
+  if (!rows.length) return null;
+  const flagged = rows.filter((r) => r.missing.length > 0 || !r.sec).length;
+
+  return (
+    <div className="space-y-3 pt-2">
+      <h3 className="text-sm font-semibold flex items-center gap-2"><AlertTriangle size={15} /> ERI coverage check</h3>
+      <p className="text-xs text-[var(--muted)]">
+        Every fund ever held unsheltered — open and fully closed positions — with the years held and which have a recorded ERI entry. A closed position still owes ERI for any accounting period that fell inside the time it was held.
+        {flagged > 0 && ` ${flagged} fund${flagged === 1 ? "" : "s"} need${flagged === 1 ? "s" : ""} a look.`}
+      </p>
+      <div className="rounded-xl border border-[var(--border)] overflow-hidden">
+        <table className="w-full text-xs">
+          <thead className="bg-[var(--panel2)] text-[var(--muted)]">
+            <tr>{["Fund", "ISIN", "Held", "Years covered", "Status"].map((h, i) => <th key={i} className="py-2 px-3 font-medium text-left">{h}</th>)}</tr>
+          </thead>
+          <tbody className="divide-y divide-[var(--border)]">
+            {rows.map((r) => (
+              <tr key={r.ticker}>
+                <td className="py-2 px-3 font-medium">{r.ticker}</td>
+                <td className="py-2 px-3">
+                  <input value={r.sec?.isin || ""} onChange={(e) => setISIN(r.ticker, e.target.value)} placeholder="IE00… (unknown)" className="input font-mono text-[10px] w-32 py-1" />
+                </td>
+                <td className="py-2 px-3 num text-[var(--muted)]">{r.firstBuy} → {r.open ? "now" : r.endDate}</td>
+                <td className="py-2 px-3 num text-[var(--muted)]">{r.eriYears.length ? r.eriYears.join(", ") : "none"}</td>
+                <td className="py-2 px-3">
+                  {!r.sec ? (
+                    <span className="inline-flex items-center gap-1 text-[var(--loss)]"><AlertTriangle size={12} /> No ISIN on record — add it to check ERI relevance</span>
+                  ) : r.sec.eri === false ? (
+                    <span className="text-[var(--muted)]">Not an offshore fund — no ERI</span>
+                  ) : r.missing.length ? (
+                    <span className="inline-flex items-center gap-1 text-[var(--loss)]"><AlertTriangle size={12} /> Missing: {r.missing.join(", ")}</span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1 text-[var(--gain)]"><Check size={12} /> Covered</span>
+                  )}
+                  {r.sec && (
+                    <button onClick={() => setEri(r.ticker, !r.sec.eri)} className="ml-2 text-[var(--accent)] underline decoration-dotted">
+                      {r.sec.eri ? "mark not ERI-relevant" : "mark ERI-relevant"}
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="text-xs text-[var(--muted)]">
+        "Years covered" matches by calendar year of each entry's period end, since fund accounting periods rarely align to UK tax years — it's a coverage indicator, not a substitute for checking each issuer's actual report. UK investment trusts (e.g. investment companies you hold as ordinary shares) never generate ERI; only offshore reporting funds (most Irish/Luxembourg-domiciled ETFs) do.
+      </p>
     </div>
   );
 }
