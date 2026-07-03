@@ -634,13 +634,18 @@ export default function App() {
   const flash = (msg) => { setStatus(msg); setTimeout(() => setStatus(""), 3500); };
 
   const exportJSON = async () => {
-    const text = JSON.stringify(txns, null, 2);
+    const backup = {
+      __cgtBackup: true, version: 2, exportedAt: new Date().toISOString(),
+      txns, incomeEntries, eriEntries, income, carried,
+      prices, priceMeta, avKey, avMeta, secMeta,
+    };
+    const text = JSON.stringify(backup, null, 2);
     let downloaded = false;
     try {
       const blob = new Blob([text], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = url; a.download = "cgt-transactions.json";
+      a.href = url; a.download = `cgt-backup-${todayISO()}.json`;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       downloaded = true;
@@ -655,8 +660,26 @@ export default function App() {
     r.onload = () => {
       try {
         const d = JSON.parse(r.result);
-        if (Array.isArray(d)) { setTxns(d.map((x) => ({ ...x, id: x.id || uid() }))); flash(`Imported ${d.length} transactions.`); }
-        else setError("That file isn't a transaction array.");
+        if (Array.isArray(d)) {
+          // Legacy export: a bare transaction array, nothing else.
+          setTxns(d.map((x) => ({ ...x, id: x.id || uid() })));
+          flash(`Imported ${d.length} transactions (legacy format — no income/ERI data in this file).`);
+        } else if (d && d.__cgtBackup) {
+          const n = (arr) => Array.isArray(arr) ? arr.length : 0;
+          if (Array.isArray(d.txns)) setTxns(d.txns.map((x) => ({ ...x, id: x.id || uid() })));
+          if (Array.isArray(d.incomeEntries)) setIncomeEntries(d.incomeEntries.map((x) => ({ ...x, id: x.id || uid() })));
+          if (Array.isArray(d.eriEntries)) setEriEntries(d.eriEntries.map((x) => ({ ...x, id: x.id || uid() })));
+          if (typeof d.income === "number") setIncome(d.income);
+          if (typeof d.carried === "number") setCarried(d.carried);
+          if (d.prices && typeof d.prices === "object") setPrices(d.prices);
+          if (d.priceMeta && typeof d.priceMeta === "object") setPriceMeta(d.priceMeta);
+          if (typeof d.avKey === "string") setAvKey(d.avKey);
+          if (d.avMeta && typeof d.avMeta === "object") setAvMeta(d.avMeta);
+          if (d.secMeta && typeof d.secMeta === "object") setSecMeta((m) => ({ ...m, ...d.secMeta }));
+          flash(`Restored: ${n(d.txns)} transactions, ${n(d.incomeEntries)} dividend/interest entries, ${n(d.eriEntries)} ERI entries, plus prices and settings.`);
+        } else {
+          setError("That file isn't a recognised backup — expected a transaction array or a full backup file exported from this app.");
+        }
       } catch { setError("Couldn't parse that JSON file."); }
     };
     r.readAsText(f);
@@ -699,8 +722,8 @@ export default function App() {
             </div>
             <div className="flex items-center gap-2">
               {status && <span className="text-xs text-[var(--muted)] mr-1 max-w-[220px] text-right leading-tight">{status}</span>}
-              <IconBtn onClick={exportJSON} title="Export / back up data (downloads a file, and copies to clipboard as a fallback)"><Download size={16} /></IconBtn>
-              <IconBtn onClick={() => fileRef.current && fileRef.current.click()} title="Import a JSON file (replaces the ledger)"><Upload size={16} /></IconBtn>
+              <IconBtn onClick={exportJSON} title="Full backup: transactions, dividends/interest, ERI, prices and settings (downloads a file; if you've set an Alpha Vantage key it's included in plain text). Also copies to clipboard as a fallback."><Download size={16} /></IconBtn>
+              <IconBtn onClick={() => fileRef.current && fileRef.current.click()} title="Restore from a full backup file (or import a legacy transactions-only JSON)"><Upload size={16} /></IconBtn>
               <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={importJSON} />
               <IconBtn onClick={() => setDark((d) => !d)} title="Theme">{dark ? <Sun size={16} /> : <Moon size={16} />}</IconBtn>
             </div>
@@ -1758,6 +1781,7 @@ function WhatIfTab({ pools, disposals, income, carried, prices = {} }) {
 
 /* --------------------------- Import tab ----------------------------- */
 const FIELDS = ["date", "ticker", "side", "quantity", "nativeCurrency", "nativeAmount", "fxRate", "gbpAmount"];
+const FIELDS_DIV = ["date", "ticker", "kind", "nativeCurrency", "nativeAmount", "fxRate", "gbpAmount"];
 function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }) {
   const [mode, setMode] = useState("ibkr");
   const [wrapper, setWrapper] = useState("GIA");
@@ -1819,6 +1843,32 @@ function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }
   const doImport = () => {
     const rows = parsed.map((r) => mapRow(r, map, normSide, wrapper)).filter((t) => t.date && t.ticker && +t.quantity > 0);
     setTxns((p) => [...p, ...rows]); setTab("ledger");
+  };
+
+  // ---- generic dividend/interest CSV ----
+  const [rawDiv, setRawDiv] = useState("");
+  const [parsedDiv, setParsedDiv] = useState(null);
+  const [mapDiv, setMapDiv] = useState({});
+  const parseDiv = () => {
+    const res = Papa.parse(rawDiv.trim(), { header: true, skipEmptyLines: true });
+    if (!res.data?.length) return;
+    const cols = res.meta.fields || [];
+    const find = (re) => cols.find((c) => re.test(c));
+    const guess = {};
+    guess.date = find(/date|pay date|ex.?date|settl/i);
+    guess.ticker = find(/ticker|symbol|instrument|stock|security/i);
+    guess.kind = find(/kind|type|category/i);
+    guess.nativeCurrency = find(/currency|ccy/i);
+    guess.nativeAmount = find(/amount|gross|net|value|proceeds/i);
+    guess.fxRate = find(/fx|rate|exchange/i);
+    guess.gbpAmount = find(/gbp|sterling/i);
+    setParsedDiv(res.data); setMapDiv(guess);
+  };
+  const normKind = (v) => /interest|coupon/i.test(v || "") ? "interest" : "dividend";
+  const previewDiv = useMemo(() => (!parsedDiv ? [] : parsedDiv.slice(0, 5).map((r) => mapDivRow(r, mapDiv, normKind, wrapper))), [parsedDiv, mapDiv, wrapper]);
+  const doImportDiv = () => {
+    const rows = parsedDiv.map((r) => mapDivRow(r, mapDiv, normKind, wrapper)).filter((t) => t.date && t.ticker && t.amount > 0);
+    setIncomeEntries((p) => [...p, ...rows]); setTab("income");
   };
 
   // ---- iShares / issuer ERI workbook ----
@@ -1890,7 +1940,7 @@ function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Tab k="ibkr" label="Interactive Brokers" /><Tab k="generic" label="Generic CSV" /><Tab k="ishares" label="iShares ERI" />
+        <Tab k="ibkr" label="Interactive Brokers" /><Tab k="generic" label="Generic CSV" /><Tab k="dividends" label="Dividends CSV" /><Tab k="ishares" label="iShares ERI" />
         <span className="ml-auto" />
         {mode !== "ishares" && <Field label="Import into wrapper"><select value={wrapper} onChange={(e) => setWrapper(e.target.value)} className="input">{WRAPPERS.map((w) => <option key={w}>{w}</option>)}</select></Field>}
       </div>
@@ -1980,6 +2030,49 @@ function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }
               <div className="flex items-center justify-between">
                 <span className="text-xs text-[var(--muted)]">{parsed.length} rows ready. GBP fills from native × FX when GBP column is unmapped.</span>
                 <button onClick={doImport} className="btn-accent"><FileUp size={15} /> Import {parsed.length} rows</button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {mode === "dividends" && (
+        <>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+            <p className="text-sm text-[var(--muted)]">
+              Paste a dividend/interest CSV from any broker (a tax certificate export, consolidated statement, etc). Columns are auto-mapped — adjust below if needed. Rows import into <strong>{wrapper}</strong> as income entries (same as adding them by hand on the Income tab), amounts net of any withholding tax already deducted at source.
+            </p>
+            <textarea value={rawDiv} onChange={(e) => setRawDiv(e.target.value)} rows={5} placeholder="Date,Symbol,Type,Currency,Amount&#10;2025-06-15,CSP1,Dividend,USD,42.10&#10;2025-07-01,,Interest,GBP,15.00" className="input num w-full font-mono text-xs" />
+            <button onClick={parseDiv} className="btn-accent"><Wand2 size={15} /> Parse & map</button>
+          </div>
+          {parsedDiv && (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {FIELDS_DIV.map((f) => (
+                  <Field key={f} label={f}>
+                    <select value={mapDiv[f] || ""} onChange={(e) => setMapDiv((m) => ({ ...m, [f]: e.target.value }))} className="input w-full text-xs">
+                      <option value="">—</option>
+                      {(Object.keys(parsedDiv[0] || {})).map((c) => <option key={c}>{c}</option>)}
+                    </select>
+                  </Field>
+                ))}
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-[var(--muted)]"><tr>{["date", "ticker", "kind", "GBP amount"].map((h) => <th key={h} className="px-2 py-1 text-left">{h}</th>)}</tr></thead>
+                  <tbody className="num">
+                    {previewDiv.map((t, i) => (
+                      <tr key={i} className="border-t border-[var(--border)]">
+                        <td className="px-2 py-1">{t.date}</td><td className="px-2 py-1">{t.ticker || "—"}</td>
+                        <td className="px-2 py-1 capitalize">{t.kind}</td><td className="px-2 py-1">{gbp(t.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-[var(--muted)]">{parsedDiv.length} rows ready. GBP fills from native × FX when GBP column is unmapped; ticker can be left blank for interest.</span>
+                <button onClick={doImportDiv} className="btn-accent"><FileUp size={15} /> Import {parsedDiv.length} rows</button>
               </div>
             </div>
           )}
@@ -2085,6 +2178,20 @@ function mapRow(r, map, normSide, wrapper) {
     id: uid(), date: (g("date") || "").slice(0, 10), ticker: (g("ticker") || "").toUpperCase().trim(),
     side: normSide(g("side")), quantity: Math.abs(parseFloat(g("quantity")) || 0),
     nativeCurrency: ccy, nativeAmount: native, fxRate: fx || 1, gbpAmount: gbpA, wrapper: wrapper || "GIA", note: "imported",
+  };
+}
+function mapDivRow(r, map, normKind, wrapper) {
+  const g = (f) => (map[f] ? r[map[f]] : "");
+  const ccy = (g("nativeCurrency") || "GBP").toUpperCase().trim();
+  const native = parseFloat(String(g("nativeAmount")).replace(/[^0-9.\-]/g, "")) || 0;
+  let fx = parseFloat(g("fxRate")) || (ccy === "GBP" ? 1 : 0);
+  let gbpA = parseFloat(String(g("gbpAmount")).replace(/[^0-9.\-]/g, "")) || 0;
+  if (!gbpA && native && fx) gbpA = +(native * fx).toFixed(2);
+  if (!fx && gbpA && native) fx = +(gbpA / native).toFixed(6);
+  if (!gbpA && ccy === "GBP") gbpA = native;
+  return {
+    id: uid(), date: (g("date") || "").slice(0, 10), ticker: (g("ticker") || "").toUpperCase().trim(),
+    kind: normKind(g("kind")), amount: gbpA, wrapper: wrapper || "GIA", note: "imported",
   };
 }
 
