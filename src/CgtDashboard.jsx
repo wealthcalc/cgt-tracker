@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 import Papa from "papaparse";
+import * as XLSX from "xlsx";
 import {
   Plus, Trash2, Download, Upload, Wand2, RefreshCw, Moon, Sun,
   TableProperties, Receipt, FlaskConical, FileUp, AlertTriangle, Check,
@@ -378,6 +379,119 @@ const SECURITY_SEED = {
   RENG: { isin: "IE00BK5BCH80", name: "iShares Renewable Energy UCITS ETF", domicile: "IE", eri: true },
 };
 
+/* ---- iShares/BlackRock "UK Reportable Income" workbook parser (one per fund
+   umbrella — iShares Plc, iShares II-VII plc — one row per share class per
+   accounting period, keyed by ISIN). Verified against 8 real files spanning
+   2021-2025 across five umbrellas (see ishares.test.mjs, 29/29). Confirmed
+   structure: Fund Umbrella Name | Fund Name | [Share Class Name] | ISIN |
+   [HMRC share class reference] | Reporting Period | Currency | Statement
+   Under Regulation 92(1)(e) | Excess of Reported Income per Unit | Fund
+   Distribution Date | Meets definition of a Bond Fund for the period |
+   Actual Distribution per Unit/Date - 1, 2, 3... (repeating, unused here).
+   "Reporting Period" is a text range ("01 July 2024 to 30 June 2025" /
+   "01.12.2024 to 30.11.2025" / "01/03/2020 to 28/02/2021" depending on
+   report year) — period end is the second date. "Meets definition of a Bond
+   Fund" is the authoritative dividend-vs-interest signal per HMRC's
+   offshore-fund ERI treatment rule. Column detection stays keyword-based
+   (not fixed-position) since column order shifts between umbrellas and
+   report years. ---- */
+const _isNorm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, " ").replace(/\s+/g, " ").trim();
+const _isHasAny = (h, ...words) => words.some((w) => h.includes(w));
+const _IS_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const _pad2 = (n) => String(n).padStart(2, "0");
+function _isParseDateText(s) {
+  const t = String(s ?? "").trim(); if (!t) return "";
+  let m = t.match(/^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$/); // "31 May 2025"
+  if (m) { const mo = _IS_MONTHS[m[2].slice(0, 3).toLowerCase()]; if (mo) return `${m[3]}-${_pad2(mo)}-${_pad2(+m[1])}`; }
+  m = t.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{4})$/); // "31/05/2025" or "31.05.2025" (dd/mm/yyyy)
+  if (m) return `${m[3]}-${_pad2(+m[2])}-${_pad2(+m[1])}`;
+  m = t.match(/^(\d{4})-(\d{2})-(\d{2})/); if (m) return `${m[1]}-${m[2]}-${m[3]}`; // "2025-05-31"
+  return "";
+}
+function _isExcelSerialToISO(n) {
+  const num = +n; if (!isFinite(num)) return "";
+  const ms = Math.round((num - 25569) * 86400 * 1000);
+  const d = new Date(ms); return isNaN(d) ? "" : d.toISOString().slice(0, 10);
+}
+function _isCellToISO(v) {
+  if (v == null || v === "") return "";
+  if (v instanceof Date) return isNaN(v) ? "" : v.toISOString().slice(0, 10);
+  if (typeof v === "number") return _isExcelSerialToISO(v);
+  return _isParseDateText(v);
+}
+function _isRangeEndToISO(v) {
+  const t = String(v ?? ""); const m = t.split(/\bto\b/i);
+  if (m.length < 2) return ""; return _isParseDateText(m[m.length - 1]);
+}
+const _ISIN_RE = /\b[A-Z]{2}[A-Z0-9]{9}\d\b/;
+function findHeaderRow(aoa, maxScan = 15) {
+  let best = -1, bestScore = -1;
+  for (let r = 0; r < Math.min(maxScan, aoa.length); r++) {
+    const row = aoa[r] || []; const cells = row.map((c) => _isNorm(c));
+    const nonEmpty = cells.filter(Boolean).length; if (nonEmpty < 3) continue;
+    const looksHeader = cells.some((c) => c === "isin" || c.includes("isin"));
+    const score = nonEmpty + (looksHeader ? 10 : 0);
+    if (score > bestScore) { bestScore = score; best = r; }
+  }
+  return best;
+}
+function guessColumnMap(headerRow) {
+  const cells = (headerRow || []).map((c) => _isNorm(c));
+  const find = (test) => { for (let i = 0; i < cells.length; i++) if (test(cells[i])) return i; return -1; };
+  const findFundName = () => {
+    let i = find((h) => _isHasAny(h, "fund name", "sub fund", "subfund"));
+    if (i >= 0) return i;
+    return find((h) => h.includes("fund") && h.includes("name"));
+  };
+  return {
+    isin: find((h) => h === "isin" || h.includes("isin")),
+    fundName: findFundName(),
+    currency: find((h) => h === "currency" || h === "ccy" || h.includes("currency")),
+    periodEnd: find((h) => _isHasAny(h, "period end", "accounting period end", "accounting date", "fund year end", "year end date", "distribution period end")),
+    reportingPeriod: find((h) => h.includes("reporting period")),
+    distributionDate: find((h) => h.includes("distribution") && h.includes("date") && !h.includes("actual")),
+    eriPerUnit: find((h) => _isHasAny(h, "excess of reported income", "excess reportable income", "reportable income per", "eri per", "excess income per") || (h.includes("excess") && h.includes("income") && !h.includes("statement"))),
+    bondFund: find((h) => h.includes("bond fund")),
+    treatment: find((h) => _isHasAny(h, "income type", "type of income", "interest distribution", "dividend distribution", "excess type")),
+  };
+}
+function extractISharesRows(aoa, headerRowIdx, colMap, holdingIsins) {
+  const out = [];
+  for (let r = headerRowIdx + 1; r < aoa.length; r++) {
+    const row = aoa[r] || []; const get = (idx) => (idx >= 0 && idx < row.length ? row[idx] : "");
+    let isin = String(get(colMap.isin) ?? "").trim().toUpperCase();
+    if (!isin && colMap.isin < 0) { const m = row.map((c) => String(c ?? "")).join(" ").match(_ISIN_RE); if (m) isin = m[0]; }
+    if (!_ISIN_RE.test(isin)) continue;
+    if (holdingIsins && holdingIsins.size && !holdingIsins.has(isin)) continue;
+    const eriRaw = get(colMap.eriPerUnit);
+    const eri = typeof eriRaw === "number" ? eriRaw : parseFloat(String(eriRaw).replace(/,/g, ""));
+    if (!isFinite(eri) || eri <= 0) continue; // zero/blank rows (fully distributed, or metadata) carry no tax impact
+
+    const periodEndISO = colMap.periodEnd >= 0 ? _isCellToISO(get(colMap.periodEnd))
+      : colMap.reportingPeriod >= 0 ? _isRangeEndToISO(get(colMap.reportingPeriod)) : "";
+    let distributionDateISO = colMap.distributionDate >= 0 ? _isCellToISO(get(colMap.distributionDate)) : "";
+    if (!distributionDateISO && periodEndISO) distributionDateISO = addMonthsISO(periodEndISO, 6);
+
+    const currencyRaw = String(get(colMap.currency) ?? "").trim().toUpperCase();
+    let treatment = "dividend";
+    if (colMap.bondFund >= 0) treatment = _isNorm(get(colMap.bondFund)).startsWith("yes") ? "interest" : "dividend";
+    else if (colMap.treatment >= 0) treatment = _isNorm(get(colMap.treatment)).includes("interest") ? "interest" : "dividend";
+
+    out.push({ isin, fundName: String(get(colMap.fundName) ?? "").trim(), currency: currencyRaw === "GBX" || currencyRaw === "GBP PENCE" ? "GBp" : (currencyRaw || "GBP"), periodEnd: periodEndISO, distributionDate: distributionDateISO, perShare: Math.round(eri * 1e6) / 1e6, treatment });
+  }
+  return out;
+}
+function parseISharesWorkbook(sheets, holdingIsins) {
+  return sheets.map((s) => {
+    const headerRowIdx = findHeaderRow(s.aoa);
+    if (headerRowIdx < 0) return { name: s.name, headerRowIdx: -1, colMap: null, headerCells: [], rows: [] };
+    const headerCells = s.aoa[headerRowIdx] || [];
+    const colMap = guessColumnMap(headerCells);
+    const rows = colMap.eriPerUnit >= 0 || colMap.isin >= 0 ? extractISharesRows(s.aoa, headerRowIdx, colMap, holdingIsins) : [];
+    return { name: s.name, headerRowIdx, colMap, headerCells, rows };
+  });
+}
+
 /* ----------------------------- helpers ------------------------------ */
 const round4 = (x) => Math.round(x * 1e4) / 1e4;
 const gbp = (x) => (x < 0 ? "−£" : "£") + Math.abs(x).toLocaleString("en-GB", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -606,7 +720,7 @@ export default function App() {
             {tab === "report" && <ReportTab {...{ taxYears, disposals: matched.disposals, income, carried }} />}
             {tab === "ledger" && <LedgerTab {...{ txns, setTxns }} />}
             {tab === "whatif" && <WhatIfTab {...{ pools: matched.pools, disposals: matched.disposals, income, carried, prices }} />}
-            {tab === "import" && <ImportTab {...{ setTxns, setTab, setIncomeEntries }} />}
+            {tab === "import" && <ImportTab {...{ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }} />}
           </div>
 
           <p className="text-xs text-[var(--muted)] mt-8 leading-relaxed">
@@ -619,7 +733,14 @@ export default function App() {
 }
 
 /* ----------------------------- Income tab --------------------------- */
-const addMonthsISO = (s, n) => { if (!s) return ""; const [y, m, d] = s.split("-").map(Number); const dt = new Date(Date.UTC(y, m - 1 + n, d)); return dt.toISOString().slice(0, 10); };
+const addMonthsISO = (s, n) => {
+  if (!s) return "";
+  const [y, m, d] = s.split("-").map(Number);
+  const target = new Date(Date.UTC(y, m - 1 + n, 1));
+  const lastDayOfTarget = new Date(Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0)).getUTCDate();
+  target.setUTCDate(Math.min(d, lastDayOfTarget));
+  return target.toISOString().slice(0, 10);
+};
 const DIV_BLANK = () => ({ id: uid(), date: todayISO(), ticker: "", kind: "dividend", amount: "" });
 const ERI_BLANK = () => ({ id: uid(), ticker: "", periodEnd: "", distributionDate: "", perShare: "", currency: "GBp", fxRate: 1, treatment: "dividend" });
 
@@ -1525,7 +1646,7 @@ function WhatIfTab({ pools, disposals, income, carried, prices = {} }) {
 
 /* --------------------------- Import tab ----------------------------- */
 const FIELDS = ["date", "ticker", "side", "quantity", "nativeCurrency", "nativeAmount", "fxRate", "gbpAmount"];
-function ImportTab({ setTxns, setTab, setIncomeEntries }) {
+function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }) {
   const [mode, setMode] = useState("ibkr");
   const [wrapper, setWrapper] = useState("GIA");
   const [raw, setRaw] = useState("");
@@ -1534,6 +1655,11 @@ function ImportTab({ setTxns, setTab, setIncomeEntries }) {
   const [ib, setIb] = useState(null);       // parseIBKR result
   const [importing, setImporting] = useState(false);
   const [note, setNote] = useState("");
+  const [wb, setWb] = useState(null);        // parsed iShares workbook: { fileName, sheets: [{name, headerRowIdx, colMap, headerCells, rows}] }
+  const [activeSheet, setActiveSheet] = useState(0);
+  const [onlyHeld, setOnlyHeld] = useState(true);
+  const [checked, setChecked] = useState({}); // isin -> bool
+  const [wbBusy, setWbBusy] = useState(false);
 
   const readFile = (e, cb) => { const f = e.target.files?.[0]; if (!f) return; const r = new FileReader(); r.onload = () => cb(String(r.result)); r.readAsText(f); e.target.value = ""; };
 
@@ -1583,6 +1709,68 @@ function ImportTab({ setTxns, setTab, setIncomeEntries }) {
     setTxns((p) => [...p, ...rows]); setTab("ledger");
   };
 
+  // ---- iShares / issuer ERI workbook ----
+  const heldIsins = useMemo(() => new Set(Object.values(secMeta || {}).map((s) => (s.isin || "").toUpperCase()).filter(Boolean)), [secMeta]);
+  const isinToTicker = useMemo(() => {
+    const m = {}; for (const [tk, s] of Object.entries(secMeta || {})) if (s.isin) m[s.isin.toUpperCase()] = tk; return m;
+  }, [secMeta]);
+
+  const readWorkbookFile = (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setWbBusy(true); setWb(null); setChecked({});
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const data = new Uint8Array(r.result);
+        const book = XLSX.read(data, { type: "array", cellDates: true });
+        const sheets = book.SheetNames.map((name) => ({ name, aoa: XLSX.utils.sheet_to_json(book.Sheets[name], { header: 1, raw: true, defval: "" }) }));
+        const result = parseISharesWorkbook(sheets, null); // parse unfiltered; "only held" is a display filter below
+        const bestSheet = result.reduce((best, s, i) => {
+          const scoreOf = (idx) => result[idx].rows.filter((row) => heldIsins.has(row.isin)).length || result[idx].rows.length;
+          return scoreOf(i) > scoreOf(best) ? i : best;
+        }, 0);
+        setWb({ fileName: f.name, sheets: result });
+        setActiveSheet(bestSheet);
+      } catch (err) {
+        setWb({ fileName: f.name, sheets: [], error: err.message || "Could not read this file as a spreadsheet." });
+      }
+      setWbBusy(false);
+    };
+    r.readAsArrayBuffer(f);
+    e.target.value = "";
+  };
+
+  const sheet = wb?.sheets?.[activeSheet];
+  const allRows = sheet?.rows || [];
+  const rows = useMemo(() => onlyHeld ? allRows.filter((r) => heldIsins.has(r.isin)) : allRows, [allRows, onlyHeld, heldIsins]);
+  React.useEffect(() => {
+    const c = {}; rows.forEach((r) => { c[r.isin] = true; }); setChecked(c);
+  }, [sheet, onlyHeld]); // eslint-disable-line
+  const toggleAll = (v) => { const c = {}; rows.forEach((r) => { c[r.isin] = v; }); setChecked(c); };
+  const selectedCount = rows.filter((r) => checked[r.isin]).length;
+
+  const doImportEri = async () => {
+    const selected = rows.filter((r) => checked[r.isin]);
+    const fxCache = {};
+    const toAdd = [];
+    for (const r of selected) {
+      const ticker = isinToTicker[r.isin] || r.isin;
+      let fxRate = r.currency === "GBP" || r.currency === "GBp" ? 1 : 0;
+      if (fxRate === 0 && r.distributionDate) {
+        const k = r.currency + r.distributionDate;
+        if (!(k in fxCache)) fxCache[k] = await fxHistorical(r.currency, r.distributionDate);
+        fxRate = fxCache[k] || 0;
+      }
+      const e = { id: uid(), ticker, periodEnd: r.periodEnd, distributionDate: r.distributionDate, perShare: +r.perShare || 0, currency: r.currency || "GBP", fxRate, treatment: r.treatment || "dividend" };
+      if (e.ticker && e.periodEnd && e.distributionDate && e.perShare) toAdd.push(e);
+    }
+    if (!toAdd.length) return;
+    setEriEntries((p) => [...p, ...toAdd]);
+    const unresolvedFx = toAdd.filter((e) => e.currency !== "GBP" && e.currency !== "GBp" && !e.fxRate).length;
+    if (unresolvedFx) setNote(`Imported ${toAdd.length} ERI entries. ${unresolvedFx} needed an FX rate that couldn't be fetched — set it manually on the Income tab.`);
+    else setTab("income");
+  };
+
   const Tab = ({ k, label }) => (
     <button onClick={() => setMode(k)} className={"px-3 py-1.5 text-sm rounded-lg border " + (mode === k ? "bg-[var(--accent)] text-[var(--accent-fg)] border-transparent" : "border-[var(--border)] text-[var(--muted)] hover:text-[var(--fg)]")}>{label}</button>
   );
@@ -1590,9 +1778,9 @@ function ImportTab({ setTxns, setTab, setIncomeEntries }) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2 flex-wrap">
-        <Tab k="ibkr" label="Interactive Brokers" /><Tab k="generic" label="Generic CSV" />
+        <Tab k="ibkr" label="Interactive Brokers" /><Tab k="generic" label="Generic CSV" /><Tab k="ishares" label="iShares ERI" />
         <span className="ml-auto" />
-        <Field label="Import into wrapper"><select value={wrapper} onChange={(e) => setWrapper(e.target.value)} className="input">{WRAPPERS.map((w) => <option key={w}>{w}</option>)}</select></Field>
+        {mode !== "ishares" && <Field label="Import into wrapper"><select value={wrapper} onChange={(e) => setWrapper(e.target.value)} className="input">{WRAPPERS.map((w) => <option key={w}>{w}</option>)}</select></Field>}
       </div>
 
       {mode === "ibkr" && (
@@ -1681,6 +1869,91 @@ function ImportTab({ setTxns, setTab, setIncomeEntries }) {
                 <span className="text-xs text-[var(--muted)]">{parsed.length} rows ready. GBP fills from native × FX when GBP column is unmapped.</span>
                 <button onClick={doImport} className="btn-accent"><FileUp size={15} /> Import {parsed.length} rows</button>
               </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {mode === "ishares" && (
+        <>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+            <p className="text-sm text-[var(--muted)]">
+              Upload an iShares/BlackRock <strong>"UK Reportable Income"</strong> workbook — one file per fund umbrella (iShares Plc, iShares III plc, iShares VII plc, etc.), downloaded from <span className="font-mono text-xs">ishares.com</span> → Literature → Tax Information. Rows are matched to your holdings by ISIN and added as excess reportable income entries — GIA only, since ISA/SIPP are exempt.
+            </p>
+            <label className="inline-flex items-center gap-2 text-sm text-[var(--accent)] cursor-pointer">
+              <Upload size={14} /> Upload workbook (.xlsx/.xls)
+              <input type="file" accept=".xlsx,.xls" className="hidden" onChange={readWorkbookFile} />
+            </label>
+            {wbBusy && <div className="flex items-center gap-2 text-xs text-[var(--muted)]"><RefreshCw size={13} className="animate-spin" /> Reading workbook…</div>}
+            {wb?.error && (
+              <div className="flex items-start gap-2 text-xs rounded-lg px-3 py-2 text-[var(--loss)]" style={{ background: "color-mix(in srgb, var(--loss) 10%, transparent)" }}><AlertTriangle size={14} className="mt-0.5 shrink-0" />{wb.error}</div>
+            )}
+          </div>
+
+          {wb && !wb.error && (
+            <div className="rounded-xl border border-[var(--border)] bg-[var(--panel)] p-4 space-y-3">
+              <div className="flex items-center gap-3 flex-wrap text-sm">
+                <span className="font-semibold truncate max-w-[16rem]" title={wb.fileName}>{wb.fileName}</span>
+                {wb.sheets.length > 1 && (
+                  <select value={activeSheet} onChange={(e) => setActiveSheet(+e.target.value)} className="input text-xs w-auto">
+                    {wb.sheets.map((s, i) => <option key={i} value={i}>{s.name} ({s.rows.length} held match{s.rows.length === 1 ? "" : "es"})</option>)}
+                  </select>
+                )}
+                <label className="flex items-center gap-1.5 text-xs cursor-pointer ml-auto">
+                  <input type="checkbox" checked={onlyHeld} onChange={(e) => setOnlyHeld(e.target.checked)} className="accent-[var(--accent)]" /> Only show my holdings
+                </label>
+              </div>
+
+              {sheet && sheet.headerRowIdx < 0 && (
+                <div className="flex items-start gap-2 text-xs rounded-lg px-3 py-2 text-[var(--loss)]" style={{ background: "color-mix(in srgb, var(--loss) 10%, transparent)" }}>
+                  <AlertTriangle size={14} className="mt-0.5 shrink-0" />Couldn't find a header row with an ISIN column in this sheet — it may not be a reportable-income report, or uses a layout this importer doesn't recognise yet.
+                </div>
+              )}
+
+              {sheet && sheet.headerRowIdx >= 0 && rows.length === 0 && (
+                <Empty msg={onlyHeld ? "No rows in this sheet match your current holdings' ISINs. Try unchecking \"Only show my holdings\", or check you've got the right umbrella file." : "No ERI rows found in this sheet (all excess income was zero, or no data rows present)."} />
+              )}
+
+              {rows.length > 0 && (
+                <>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead className="text-[var(--muted)]">
+                        <tr>
+                          <th className="px-2 py-1 text-left"><input type="checkbox" checked={selectedCount === rows.length} onChange={(e) => toggleAll(e.target.checked)} className="accent-[var(--accent)]" /></th>
+                          {["Fund", "Ticker", "ISIN", "Period end", "Distribution date", "ERI/unit", "Ccy", "Taxed as"].map((h) => <th key={h} className="px-2 py-1 text-left">{h}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody className="num">
+                        {rows.map((r) => {
+                          const ticker = isinToTicker[r.isin];
+                          return (
+                            <tr key={r.isin + r.periodEnd} className="border-t border-[var(--border)]">
+                              <td className="px-2 py-1"><input type="checkbox" checked={!!checked[r.isin]} onChange={(e) => setChecked((c) => ({ ...c, [r.isin]: e.target.checked }))} className="accent-[var(--accent)]" /></td>
+                              <td className="px-2 py-1 max-w-[14rem] truncate" title={r.fundName}>{r.fundName}</td>
+                              <td className="px-2 py-1 font-medium">{ticker || <span className="text-[var(--loss)]" title="No ticker in your holdings has this ISIN — add it on the Holdings tab first">unmatched</span>}</td>
+                              <td className="px-2 py-1 font-mono text-[var(--muted)]">{r.isin}</td>
+                              <td className="px-2 py-1">{r.periodEnd}</td>
+                              <td className="px-2 py-1">{r.distributionDate}</td>
+                              <td className="px-2 py-1">{r.perShare}</td>
+                              <td className="px-2 py-1">{r.currency}</td>
+                              <td className="px-2 py-1 capitalize">{r.treatment}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                  <p className="text-xs text-[var(--muted)]">
+                    "Taxed as" comes straight from the report's own "Meets definition of a Bond Fund" flag — bond funds are taxed as interest, everything else as dividend. Rows marked <span className="text-[var(--loss)]">unmatched</span> don't have a ticker with that ISIN on your Holdings tab; add the ISIN there first if you want to import them. Non-GBP amounts have their FX rate fetched automatically for the distribution date on import.
+                  </p>
+                  {note && <div className="text-xs text-[var(--muted)]">{note}</div>}
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-[var(--muted)]">{selectedCount}/{rows.length} selected.</span>
+                    <button onClick={doImportEri} disabled={!selectedCount} className="btn-accent disabled:opacity-50"><FileUp size={15} /> Import {selectedCount} ERI entr{selectedCount === 1 ? "y" : "ies"}</button>
+                  </div>
+                </>
+              )}
             </div>
           )}
         </>
