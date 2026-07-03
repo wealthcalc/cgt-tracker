@@ -1,11 +1,13 @@
 import React, { useState, useMemo, useCallback, useRef } from "react";
 import Papa from "papaparse";
-import * as XLSX from "xlsx";
 import {
   Plus, Trash2, Download, Upload, Wand2, RefreshCw, Moon, Sun,
   TableProperties, Receipt, FlaskConical, FileUp, AlertTriangle, Check,
   Wallet, TrendingUp, TrendingDown, FileText, Printer, AlertCircle, PoundSterling,
 } from "lucide-react";
+// xlsx (SheetJS) is ~120kb gzipped and only needed for the iShares ERI
+// importer, so it's loaded on demand (see readWorkbookFile) rather than
+// bundled into the initial page load.
 
 // Safe localStorage wrapper: persists on the deployed app, silently no-ops in
 // sandboxed preview frames where storage access throws.
@@ -384,11 +386,7 @@ const SECURITY_SEED = {
   CNX1: { isin: "IE00B53SZB19", name: "iShares NASDAQ 100 UCITS ETF (Acc)", domicile: "IE", eri: true },
   DGIT: { isin: "IE00BYZK4883", name: "iShares Digitalisation UCITS ETF (Acc)", domicile: "IE", eri: true },
   USDV: { isin: "IE00B6YX5D40", name: "SPDR S&P US Dividend Aristocrats UCITS ETF (Dist)", domicile: "IE", eri: true },
-  // SAIC: ISIN not resolved — ticker doesn't match any confirmable LSE fund
-  // via web search. Add manually on the Holdings tab if you have the ISIN
-  // (e.g. from a contract note); until then it's excluded from ISIN-based
-  // ERI matching but the ERI coverage checker below will still flag it by
-  // ticker so it isn't silently missed.
+  SAIC: { isin: "GB0007873697", name: "Scottish American Investment Company plc", domicile: "GB", eri: false },
 };
 
 /* ---- iShares/BlackRock "UK Reportable Income" workbook parser (one per fund
@@ -541,16 +539,51 @@ async function avQuote(symbol, key) {
   if (p == null || p === "") throw new Error(`No quote for "${symbol}" (LSE symbols need .LON).`);
   return parseFloat(p);
 }
-async function fxToGBP(ccy) {
-  if (ccy === "GBP" || ccy === "GBp") return 1;
-  try { const r = await fetch(`https://api.frankfurter.dev/v1/latest?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
-  catch { return null; }
-}
-// FX on a specific date (for imports that lack an FX-to-base rate).
-async function fxHistorical(ccy, date) {
-  if (ccy === "GBP" || ccy === "GBp") return 1;
+/* ---- FX rate resolution: three-tier fallback.
+   1. Frankfurter (frankfurter.dev) — primary, free, no key, no shared budget.
+   2. Yahoo Finance, via the /api/fx serverless proxy — same infra as live
+      prices, covers gaps when Frankfurter lacks a date/pair or is down.
+   3. Alpha Vantage FX_DAILY — last resort, since it shares the same 25/day
+      budget as equity price lookups (see avBudget/avBump below).
+   All three return the same thing: GBP per 1 unit of the given currency. ---- */
+async function fxViaFrankfurter(ccy, date) {
   try { const r = await fetch(`https://api.frankfurter.dev/v1/${date}?from=${ccy}&to=GBP`); const j = await r.json(); return j?.rates?.GBP ?? null; }
   catch { return null; }
+}
+async function fxViaYahoo(ccy, date) {
+  try { const r = await fetch(`/api/fx?ccy=${encodeURIComponent(ccy)}&date=${encodeURIComponent(date)}`); if (!r.ok) return null; const j = await r.json(); return j?.rate ?? null; }
+  catch { return null; }
+}
+async function fxViaAlphaVantage(ccy, date, key) {
+  if (!key) return null;
+  try {
+    const res = await fetch(`${AV_URL}?function=FX_DAILY&from_symbol=${encodeURIComponent(ccy)}&to_symbol=GBP&apikey=${encodeURIComponent(key)}`);
+    const j = await res.json();
+    if (j.Note || j.Information) return null; // rate limit or bad key — fail soft, let the caller try elsewhere
+    const series = j["Time Series FX (Daily)"];
+    if (!series) return null;
+    const onOrBefore = Object.keys(series).filter((d) => d <= date).sort();
+    const pick = onOrBefore.length ? onOrBefore[onOrBefore.length - 1] : Object.keys(series).sort()[0];
+    const close = pick && series[pick] && series[pick]["4. close"];
+    return close ? parseFloat(close) : null;
+  } catch { return null; }
+}
+async function fxHistorical(ccy, date) {
+  if (ccy === "GBP" || ccy === "GBp") return 1;
+  let rate = await fxViaFrankfurter(ccy, date);
+  if (rate) return rate;
+  rate = await fxViaYahoo(ccy, date);
+  if (rate) return rate;
+  const key = store.get("cgt.avkey", "");
+  if (key && avBudget().n < 25) {
+    rate = await fxViaAlphaVantage(ccy, date, key);
+    if (rate) { avBump(); return rate; }
+  }
+  return null;
+}
+async function fxToGBP(ccy) {
+  if (ccy === "GBP" || ccy === "GBp") return 1;
+  return fxHistorical(ccy, todayISO());
 }
 const toGBP = (raw, ccy, fx) => (ccy === "GBp" ? raw / 100 : ccy === "GBP" ? raw : fx ? raw * fx : null);
 const avBudget = () => { const c = store.get("cgt.avcount", { date: "", n: 0 }); return c.date === todayISO() ? c : { date: todayISO(), n: 0 }; };
@@ -1881,8 +1914,9 @@ function ImportTab({ setTxns, setTab, setIncomeEntries, setEriEntries, secMeta }
     const f = e.target.files?.[0]; if (!f) return;
     setWbBusy(true); setWb(null); setChecked({});
     const r = new FileReader();
-    r.onload = () => {
+    r.onload = async () => {
       try {
+        const XLSX = await import("xlsx"); // loaded on demand — see note at top of file
         const data = new Uint8Array(r.result);
         const book = XLSX.read(data, { type: "array", cellDates: true });
         const sheets = book.SheetNames.map((name) => ({ name, aoa: XLSX.utils.sheet_to_json(book.Sheets[name], { header: 1, raw: true, defval: "" }) }));
